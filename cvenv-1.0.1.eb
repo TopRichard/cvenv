@@ -2,16 +2,17 @@
 easyblock = 'Bundle'
 
 name = 'cvenv'
-version = '1.0'
+version = '1.0.1'
 
 homepage = 'https://github.com/TopRichard/cvenv'
 
-whatis = ['Description: Transparent compressed Python venvs for parallel filesystems']
+whatis = ['Description: Transparent compressed Python and conda venvs for parallel filesystems']
 
-description = """Compressed Python Virtual Environments
+description = """Compressed Python and Conda Virtual Environments
 
-This module keeps an expanded Python virtual environment in job-local scratch
-and stores it as one compressed tar archive on the parallel filesystem.
+This module keeps an expanded Python virtual environment or conda environment
+in job-local scratch and stores it as one compressed tar archive on the
+parallel filesystem.
 
 Typical use:
 
@@ -41,15 +42,20 @@ Environment variables:
   CV_JOB_SCRATCH   Expansion directory. Defaults to /tmp/<job-id> inside a
                    Slurm allocation, or /tmp/cvenv_<user> outside Slurm.
                    Each node decompresses into its own node-local /tmp.
-  CV_JOB_CACHE     Pip cache directory. If set, overrides PIP_CACHE_DIR.
-                   Defaults to $SCRATCH if defined, otherwise $LOCALSCRATCH
-                   if defined, otherwise pip's default.
+  CV_JOB_CACHE     Pip/uv cache directory. If set, overrides PIP_CACHE_DIR
+                   and UV_CACHE_DIR.  Defaults to $SCRATCH if defined,
+                   otherwise $LOCALSCRATCH if defined, otherwise pip's default.
   CVENV_RO         Set to 1 to skip recompression on deactivation when no
                    packages were installed.  Mutating commands (pip install,
-                   uv add/remove/sync) always recompress regardless.  uv run
-                   sets this automatically.  Set to 0 to force recompression
-                   everywhere.  Default: 1 for uv run, unset otherwise.
+                   uv add/remove/sync, conda install/remove) always recompress
+                   regardless.  uv run sets this automatically.  Set to 0 to
+                   force recompression everywhere.  Default: 1 for uv run,
+                   unset otherwise.
 Notes:
+  * A <name>.README.md file is written next to the archive every time the
+    environment is saved.  It lists the Lmod modules that were loaded
+    (from $LOADEDMODULES) and shows the exact commands to reload them
+    and reactivate the environment in a new job.
   * The implementation is intended for Bash.
   * Multi-node Slurm allocations are supported.  Each node decompresses
     its own independent copy of the environment into node-local /tmp.
@@ -59,14 +65,11 @@ Notes:
     environment, but pip install / uv add / deactivate on a non-head node
     will NOT persist changes to the archive.  Install packages on the head
     node only.
-  * In multi-node jobs use 'cvexec' to launch MPI commands so that every
-    rank decompresses and activates the venv on its own node.  Separate
-    launcher options from the payload command with '--'.  Examples:
-    cvexec srun -n 4 -- python script.py
-    A launcher with no options can omit the '--':
-    cvexec srun python script.py
-    Without cvexec, non-head ranks inherit VIRTUAL_ENV / PATH from the
-    head node pointing to a /tmp path that does not exist locally.
+  * In multi-node jobs the environment is automatically propagated to all
+    nodes when you activate it on the head node (source myenv/bin/activate
+    or conda activate myenv).  After activation, plain 'srun python
+    script.py' works on every node because each node already has the venv
+    in its own /tmp.
   * Always run deactivate before leaving a job when practical.
   * Do not activate the same archive concurrently from multiple jobs. The
     last writer would otherwise replace changes made by another job.
@@ -79,12 +82,23 @@ Notes:
    force it); mutating commands auto-deactivate when you
    cd away from the owning directory.  Read-only commands use uv's own
    .venv discovery.
+ * conda / miniconda support is enabled automatically when conda is found
+   on PATH at module load time.  "conda create", "conda env create", and
+   "conda activate" are intercepted so the environment lives in job-local
+   scratch while only a compressed archive is stored on the parallel
+   filesystem.  "conda install" / "conda remove" against an active
+   environment recompress the archive automatically.  "conda deactivate"
+   archives and cleans up the scratch copy.  Environments created with
+   "conda create -n <name>" are stored as <name>.tar.zst; environments
+   created with "conda env create -f environment.yml" use the name from
+   the file (or the basename of environment.yml if no name is given).
 """
 
 toolchain = SYSTEM
 
 # Embed the updated Lua implementation in the generated module file.
-# This includes multi-node Slurm support and the cvexec MPI launcher wrapper.
+# This includes multi-node Slurm support and automatic node propagation at
+# activation time.
 modluafooter = r"""
 -- Configuration -------------------------------------------------------
 local user = os.getenv("USER") or "unknown"
@@ -152,6 +166,7 @@ local pzstd = command_path("pzstd")
 local python = command_path("python")
 local python3 = command_path("python3")
 local uv = command_path("uv")
+local conda = command_path("conda")
 local backend_ext
 local backend_compress
 local backend_decompress
@@ -182,6 +197,7 @@ setenv("CV_BACKEND_DECOMPRESS", backend_decompress)
 setenv("CV_ORIGINAL_PYTHON", python)
 setenv("CV_ORIGINAL_PYTHON3", python3)
 setenv("CV_UV", uv)
+setenv("CV_CONDA", conda)
 setenv("CV_JOB_CACHE", job_cache)
 if job_cache ~= "" then
     setenv("PIP_CACHE_DIR", job_cache)
@@ -208,469 +224,177 @@ set_shell_function("_cv_scratch_cleanup", [==[
 rmdir "$CV_JOB_SCRATCH" 2>/dev/null || true
 ]==], "")
 
-set_shell_function("_cv_reactivate", [==[
-# Re-establish the venv on the current node.  Called by cvexec on every
-# rank to fix VIRTUAL_ENV / PATH inherited from the head node (which point
-# to a /tmp path that does not exist on this node).
+set_shell_function("_cv_write_dummy_activate", [==[
+# After deactivation, leave a stub <venv>/bin/activate so that
+# "source myvenv/bin/activate" works the same as in a standard Python
+# venv, even though the expanded environment has been archived and
+# removed from scratch.  The stub is a minimal placeholder; the cvenv
+# "source" wrapper detects it (via the CVENV_STUB marker) and runs the
+# full decompress -> activate -> propagate flow as if the file did not
+# exist.
 local venv_name="$1"
 local archive_dir="$2"
-local venv_subdir="${3:-}"
-local target="${CV_JOB_SCRATCH}/${venv_name}"
-local activate_path="${target}${venv_subdir}/bin/activate"
+local link_path="$3"
+local venv_subdir="${4:-}"
+local activate_path="${link_path}${venv_subdir}/bin/activate"
 
-# Strip any stale node-local venv paths from PATH.
-local _cv_stale
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    _cv_stale="${VIRTUAL_ENV}/bin"
-    PATH=":${PATH:-}:"
-    PATH="${PATH//:${_cv_stale}:/:}"
-    PATH="${PATH#:}"; PATH="${PATH%:}"
-    export PATH
-fi
+# Only the writer node creates the stub.
+[ "${CV_IS_WRITER:-1}" = "1" ] || return 0
 
-# Decompress into this node's /tmp if not already present.
-if [ ! -f "$activate_path" ]; then
-    _cv_decompress_venv "$venv_name" "$archive_dir" || return 1
-fi
+# Don't create a stub if there's no archive to restore from.
+local tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
+[ -f "$tarball" ] || return 0
 
-# Activate so VIRTUAL_ENV and PATH point to this node's local copy.
-unset VIRTUAL_ENV
-builtin source "$activate_path" || return 1
-_cv_log "Reactivated $venv_name on $(hostname 2>/dev/null || echo unknown)"
+mkdir -p "$(dirname "$activate_path")" 2>/dev/null || return 0
+
+cat > "$activate_path" <<'STUB'
+# CVENV_STUB
+# This is a placeholder generated by cvenv.  The real venv has been
+# archived. If the cvenv
+# module is not loaded, load it first:
+#   module load cvenv
+#   source <venv>/bin/activate
+STUB
+chmod +x "$activate_path" 2>/dev/null || true
 ]==], "")
 
-set_shell_function("cvexec", [==[
-# Wrapper for MPI launchers (mpirun, srun, etc.) that ensures every rank
-# decompresses and activates the venv on its own node before running the
-# command.  Without this, non-head ranks inherit VIRTUAL_ENV / PATH from
-# the head node pointing to a /tmp path that does not exist locally.
+set_shell_function("_cv_augment_ld_path", [==[
+# Save the current LD_LIBRARY_PATH and append CRAY_LD_LIBRARY_PATH (and
+# optionally an extra path such as $CONDA_PREFIX/lib for conda envs) so
+# that Python extensions can dlopen Cray MPI/accelerator libraries at
+# runtime.  On Cray systems CRAY_LD_LIBRARY_PATH is maintained by the
+# module system but is not automatically merged into LD_LIBRARY_PATH for
+# dynamically-linked payloads.
 #
-# Usage: cvexec <launcher> [launcher-options] [-- <command> [args...]]
-#   cvexec srun -n 4 -- python script.py
-#   cvexec srun python script.py          # no launcher options: '--' optional
-#
-# The '--' is required whenever launcher options are given.  Without it,
-# cvexec cannot tell where the launcher's own flags end and the payload
-# command begins, since flags like '-n 4' and a command's own arguments
-# are otherwise indistinguishable on the command line.
-#if [ -z "${VIRTUAL_ENV:-}" ]; then
-#    _cv_log "WARNING: cvexec called without an active venv; running command as-is"
-#    "$@"
-#    return $?
-#fi
-if [ -z "${VIRTUAL_ENV:-}" ]; then
-    local _cv_search_dir="$PWD"
-    local _cv_found_archive=""
-    local _cv_found_archive_dir=""
-
-    while [ "$_cv_search_dir" != "/" ]; do
-        local _cv_candidate_dir
-
-        if [ -n "$CV_ARCHIVE_DIR" ]; then
-            _cv_candidate_dir="$CV_ARCHIVE_DIR"
-        else
-            _cv_candidate_dir="$_cv_search_dir"
-        fi
-
-        if [ -f "$_cv_candidate_dir/.venv${CV_BACKEND_EXT}" ]; then
-            _cv_found_archive="$_cv_candidate_dir/.venv${CV_BACKEND_EXT}"
-            _cv_found_archive_dir="$_cv_candidate_dir"
-            break
-        fi
-
-        if [ -L "$_cv_search_dir/.venv" ]; then
-            _cv_found_archive_dir="$_cv_candidate_dir"
-            break
-        fi
-
-        _cv_search_dir=$(dirname "$_cv_search_dir")
-    done
-
-    if [ -z "$_cv_found_archive_dir" ]; then
-        _cv_log "ERROR: cvexec could not find .venv${CV_BACKEND_EXT}"
-        return 1
-    fi
-
-    _cv_decompress_venv ".venv" "$_cv_found_archive_dir" || return 1
-
-    local _cv_auto_target="$CV_JOB_SCRATCH/.venv"
-    local _cv_auto_link="$_cv_search_dir/.venv"
-
-    ln -sfn "$_cv_auto_target" "$_cv_auto_link" || return 1
-
-    builtin source "$_cv_auto_target/bin/activate" || return 1
-
-    _cv_patch_deactivate \
-        ".venv" \
-        "$_cv_auto_target" \
-        "$_cv_found_archive_dir" \
-        "$_cv_auto_link" \
-        ""
-
-    _cv_log "Auto-activated $_cv_auto_link for cvexec"
+local _extra="${1:-}"
+if [ -z "${_CV_LD_LIBRARY_PATH_BACKUP+x}" ]; then
+    _CV_LD_LIBRARY_PATH_BACKUP="${LD_LIBRARY_PATH:-}"
 fi
-if [ "$#" -eq 0 ]; then
-    _cv_log "ERROR: usage: cvexec <launcher> [launcher-options] [-- <command> [args...]]"
-    return 2
-fi
-
-# Determine the venv name, archive dir, and subdir from the current state.
-local _cv_exec_venv_name=""
-local _cv_exec_archive_dir=""
-local _cv_exec_venv_subdir=""
-
-if [ -n "${_CV_ACTIVE_DIR:-}" ]; then
-    _cv_exec_venv_name="${_CV_ACTIVE_NAME:-$(basename "$_CV_ACTIVE_DIR")}"
-    _cv_exec_archive_dir="${_CV_ACTIVE_ARCHIVE_DIR:-$(_cv_archive_dir)}"
-    _cv_exec_venv_subdir="${_CV_ACTIVE_VENV_SUBDIR:-}"
-elif [ -n "${_CV_EXPANDED_DIR:-}" ]; then
-    _cv_exec_venv_name=$(basename "$_CV_EXPANDED_DIR")
-    _cv_exec_archive_dir="${_CV_EXPANDED_ARCHIVE_DIR:-$(_cv_archive_dir)}"
-    _cv_exec_venv_subdir=""
-else
-    # Fallback: derive from VIRTUAL_ENV.
-    #local _cv_ve="$VIRTUAL_ENV"
-    #case "$_cv_ve" in
-    #    */.venv)
-    #        local _cv_parent
-    #        _cv_parent=$(dirname "$_cv_ve")
-    #        _cv_exec_venv_name=$(basename "$_cv_parent")
-    #        _cv_exec_venv_subdir="/.venv"
-    #        ;;
-    #    *)
-    #        _cv_exec_venv_name=$(basename "$_cv_ve")
-    #        ;;
-    #esac
-    #_cv_exec_archive_dir=$(_cv_archive_dir)
-    # Fallback: derive metadata from VIRTUAL_ENV.
-    local _cv_ve="$VIRTUAL_ENV"
-
-    if [ "$_cv_ve" = "$CV_JOB_SCRATCH/.venv" ]; then
-        # Bare environment created with:
-        #     uv venv .venv
-        #
-        # Archive:
-        #     <archive-dir>/.venv.tar.zst
-        #
-        # Expanded location:
-        #     $CV_JOB_SCRATCH/.venv
-        _cv_exec_venv_name=".venv"
-        _cv_exec_venv_subdir=""
-    else
-        case "$_cv_ve" in
-        "$CV_JOB_SCRATCH"/*/.venv)
-            # Project created with:
-            #     uv init <project>
-            #
-            # Archive:
-            #     <archive-dir>/<project>.tar.zst
-            #
-            # Expanded location:
-            #     $CV_JOB_SCRATCH/<project>/.venv
-            local _cv_project_dir
-            _cv_project_dir=$(dirname "$_cv_ve")
-            _cv_exec_venv_name=$(basename "$_cv_project_dir")
-            _cv_exec_venv_subdir="/.venv"
-            ;;
+if [ -n "${CRAY_LD_LIBRARY_PATH:-}" ]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":$CRAY_LD_LIBRARY_PATH:"*) ;;
         *)
-            # Ordinary named venv.
-            _cv_exec_venv_name=$(basename "$_cv_ve")
-            _cv_exec_venv_subdir=""
+            if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$CRAY_LD_LIBRARY_PATH"
+            else
+                LD_LIBRARY_PATH="$CRAY_LD_LIBRARY_PATH"
+            fi
             ;;
-        esac
-    fi
-_cv_exec_archive_dir=$(_cv_archive_dir)
+    esac
 fi
-
-[ -n "$_cv_exec_venv_name" ] || {
-    _cv_log "ERROR: cvexec could not determine the active venv name"
-    return 1
-}
-
-# Build a per-rank setup script that cvexec will inject as the launched
-# program.  We export the variables the script needs.
-export _CV_EXEC_VENV_NAME="$_cv_exec_venv_name"
-export _CV_EXEC_ARCHIVE_DIR="$_cv_exec_archive_dir"
-export _CV_EXEC_VENV_SUBDIR="$_cv_exec_venv_subdir"
-
-# Create a temporary prefix script that each rank sources before the command.
-# This must live on the shared filesystem so every node can read it.
-local _cv_shared_dir
-_cv_shared_dir="${CV_ARCHIVE_DIR:-$PWD}"
-[ -d "$_cv_shared_dir" ] || _cv_shared_dir="$PWD"
-local _cv_prefix_script
-_cv_prefix_script=$(mktemp "${_cv_shared_dir}/.cvexec.XXXXXX.sh") || {
-    _cv_log "ERROR: cvexec could not create prefix script"
-    return 1
-}
-cat > "$_cv_prefix_script" <<'PREFIX'
-# Auto-generated by cvenv cvexec; sourced by every launched task.
-_cv_rank_error() {
-    printf '[cvenv] ERROR on %s: %s\n' \
-        "$(hostname 2>/dev/null || printf unknown)" "$*" >&2
-}
-
-if [ -z "${_CV_EXEC_VENV_NAME:-}" ] || \
-   [ -z "${_CV_EXEC_ARCHIVE_DIR:-}" ] || \
-   [ -z "${CV_JOB_SCRATCH:-}" ] || \
-   [ -z "${CV_BACKEND_EXT:-}" ] || \
-   [ -z "${CV_BACKEND_DECOMPRESS:-}" ]; then
-    _cv_rank_error "missing cvexec environment metadata"
-    return 1 2>/dev/null || exit 1
+if [ -n "$_extra" ]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":$_extra:"*) ;;
+        *)
+            if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$_extra"
+            else
+                LD_LIBRARY_PATH="$_extra"
+            fi
+            ;;
+    esac
 fi
-
-_target="${CV_JOB_SCRATCH}/${_CV_EXEC_VENV_NAME}"
-_activate="${_target}${_CV_EXEC_VENV_SUBDIR:-}/bin/activate"
-_tarball="${_CV_EXEC_ARCHIVE_DIR}/${_CV_EXEC_VENV_NAME}${CV_BACKEND_EXT}"
-_ready="${_target}/.cvenv-cvexec-ready"
-_lock="${CV_JOB_SCRATCH}/.${_CV_EXEC_VENV_NAME}.cvexec.lock"
-
-# Remove the inherited head-node venv path. It refers to node-local /tmp on
-# another host and must not be used before this node's environment is ready.
-if [ -n "${VIRTUAL_ENV:-}" ]; then
-    _stale="${VIRTUAL_ENV}/bin"
-    PATH=":${PATH:-}:"
-    PATH="${PATH//:${_stale}:/:}"
-    PATH="${PATH#:}"
-    PATH="${PATH%:}"
-    export PATH
-fi
-
-mkdir -p "$CV_JOB_SCRATCH" || {
-    _cv_rank_error "cannot create job scratch: $CV_JOB_SCRATCH"
-    return 1 2>/dev/null || exit 1
-}
-
-# All tasks on one node share this node-local lock. Only the first task does
-# setup. Others wait, recheck the ready marker, then activate concurrently.
-exec 9>"$_lock" || {
-    _cv_rank_error "cannot open setup lock: $_lock"
-    return 1 2>/dev/null || exit 1
-}
-if command -v flock >/dev/null 2>&1; then
-    flock 9 || {
-        _cv_rank_error "cannot acquire setup lock: $_lock"
-        return 1 2>/dev/null || exit 1
-    }
-else
-    _cv_rank_error "flock is required for multi-task node setup"
-    return 1 2>/dev/null || exit 1
-fi
-
-# Double-check after acquiring the lock, because another task may have
-# completed setup while this task was waiting.
-if [ ! -f "$_ready" ]; then
-    if [ ! -f "$_activate" ]; then
-        [ -f "$_tarball" ] || {
-            _cv_rank_error "archive not found: $_tarball"
-            return 1 2>/dev/null || exit 1
-        }
-
-        _stage="${CV_JOB_SCRATCH}/.cvexec-${_CV_EXEC_VENV_NAME}-stage.$$"
-        command rm -rf "$_stage"
-        mkdir -p "$_stage" || {
-            _cv_rank_error "cannot create extraction stage: $_stage"
-            return 1 2>/dev/null || exit 1
-        }
-
-        set -o pipefail
-        eval "$CV_BACKEND_DECOMPRESS \"$_tarball\"" | tar -xf - -C "$_stage"
-        _extract_rc=$?
-        set +o pipefail
-        if [ "$_extract_rc" -ne 0 ]; then
-            command rm -rf "$_stage"
-            _cv_rank_error "archive extraction failed with status $_extract_rc: $_tarball"
-            return "$_extract_rc" 2>/dev/null || exit "$_extract_rc"
-        fi
-
-        _staged_target="${_stage}/${_CV_EXEC_VENV_NAME}"
-        _staged_activate="${_staged_target}${_CV_EXEC_VENV_SUBDIR:-}/bin/activate"
-        [ -f "$_staged_activate" ] || {
-            command rm -rf "$_stage"
-            _cv_rank_error "activate missing from extracted archive: $_staged_activate"
-            return 1 2>/dev/null || exit 1
-        }
-
-        command rm -rf "$_target"
-        mv "$_staged_target" "$_target" || {
-            command rm -rf "$_stage"
-            _cv_rank_error "cannot publish extracted environment: $_target"
-            return 1 2>/dev/null || exit 1
-        }
-        command rm -rf "$_stage"
-    fi
-
-    [ -f "$_activate" ] || {
-        _cv_rank_error "activation file not found: $_activate"
-        return 1 2>/dev/null || exit 1
-    }
-
-    # Rewrite text files under bin when the archive was created in an older
-    # job-local path, such as /tmp/2116439 instead of the current job path.
-    _marker="${_target}/.cvenv-prefix"
-    if [ -f "$_marker" ]; then
-        _old_prefix=$(cat "$_marker")
-        if [ -n "$_old_prefix" ] && [ "$_old_prefix" != "$_target" ]; then
-            printf '[cvenv] Relocating environment prefix on %s: %s -> %s\n' \
-                "$(hostname 2>/dev/null || printf unknown)" \
-                "$_old_prefix" "$_target" >&2
-
-            _relocate_python="${CV_ORIGINAL_PYTHON3:-${CV_ORIGINAL_PYTHON:-python3}}"
-            while IFS= read -r -d '' _file; do
-                chmod u+w "$_file" 2>/dev/null || true
-                OLD_PREFIX="$_old_prefix" NEW_PREFIX="$_target" \
-                    "$_relocate_python" -c 'import os,pathlib,sys;p=pathlib.Path(sys.argv[1]);d=p.read_bytes();o=os.environ["OLD_PREFIX"].encode();n=os.environ["NEW_PREFIX"].encode();p.write_bytes(d.replace(o,n)) if o in d else None' \
-                    "$_file" || {
-                        _cv_rank_error "failed to relocate: $_file"
-                        return 1 2>/dev/null || exit 1
-                    }
-            done < <(grep -IlZR -- "$_old_prefix" "$_target/bin" 2>/dev/null || true)
-
-            printf '%s\n' "$_target" > "$_marker" || {
-                _cv_rank_error "cannot update relocation marker: $_marker"
-                return 1 2>/dev/null || exit 1
-            }
-        fi
-    fi
-
-    # Ready means extraction, publication, relocation and basic validation
-    # all completed while the exclusive node-local lock was held.
-    [ -f "$_activate" ] || {
-        _cv_rank_error "activation file disappeared during setup: $_activate"
-        return 1 2>/dev/null || exit 1
-    }
-    : > "$_ready" || {
-        _cv_rank_error "cannot create ready marker: $_ready"
-        return 1 2>/dev/null || exit 1
-    }
-fi
-
-# Release the setup lock before running the payload. All tasks may now proceed.
-flock -u 9
-exec 9>&-
-
-[ -f "$_ready" ] && [ -f "$_activate" ] || {
-    _cv_rank_error "environment is not ready: $_target"
-    return 1 2>/dev/null || exit 1
-}
-
-unset VIRTUAL_ENV
-. "$_activate" || {
-    _cv_rank_error "failed to source: $_activate"
-    return 1 2>/dev/null || exit 1
-}
-
-_expected="${_target}${_CV_EXEC_VENV_SUBDIR:-}"
-if [ "${VIRTUAL_ENV:-}" != "$_expected" ]; then
-    _cv_rank_error "unexpected VIRTUAL_ENV=${VIRTUAL_ENV:-unset}; expected $_expected"
-    return 1 2>/dev/null || exit 1
-fi
-PREFIX
-export _CV_PREFIX_SCRIPT="$_cv_prefix_script"
-
-# Split the launcher's own options from the payload command using '--'.
-# This is unavoidable in general: a flag like "-n 4" is indistinguishable
-# from a payload argument without it, and that ambiguity is exactly what
-# broke earlier versions of cvexec (launcher flags ended up being passed
-# as arguments to the per-rank wrapper's "exec" call instead of to the
-# launcher, e.g. "exec: -n: invalid option").
-#
-# If no '--' is present at all, treat every remaining argument as the
-# payload command (no launcher options), preserving the simple
-# "cvexec <launcher> <command> [args...]" form for callers who don't
-# need to pass any launcher options.
-local _cv_launcher="$1"
-shift
-local -a _cv_launcher_opts=()
-local _cv_has_sep=0
-local _cv_arg
-for _cv_arg in "$@"; do
-    if [ "$_cv_arg" = "--" ]; then
-        _cv_has_sep=1
-        break
-    fi
-done
-if [ "$_cv_has_sep" -eq 1 ]; then
-    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
-        _cv_launcher_opts+=("$1")
-        shift
-    done
-    shift # drop the '--'
-fi
-
-if [ "$#" -eq 0 ]; then
-    _cv_log "ERROR: no command given; usage: cvexec $_cv_launcher [options] -- <command> [args...]"
-    rm -f "$_cv_prefix_script"
-    return 2
-fi
-
-case "$1" in
-    -*)
-        _cv_log "ERROR: '$1' looks like a launcher option, not a command."
-        _cv_log "ERROR: did you forget '--'? usage: cvexec $_cv_launcher [options] -- <command> [args...]"
-        rm -f "$_cv_prefix_script"
-        return 2
-        ;;
-esac
-
-local _cv_wrapper_suffix="generic"
-case "$_cv_launcher" in
-    mpirun|mpiexec) _cv_wrapper_suffix="mpirun" ;;
-    srun)           _cv_wrapper_suffix="srun" ;;
-esac
-if [ "$_cv_wrapper_suffix" = "generic" ] && [ "${CV_MULTI_NODE:-0}" = "1" ]; then
-    _cv_log "WARNING: cvexec has no built-in support for '$_cv_launcher'; attempting generic injection"
-fi
-
-local _cv_wrapper
-_cv_wrapper=$(mktemp "${_cv_shared_dir}/.cvexec.XXXXXX.${_cv_wrapper_suffix}.sh") || {
-    _cv_log "ERROR: cvexec could not create launcher wrapper"
-    rm -f "$_cv_prefix_script"
-    return 1
-}
-cat > "$_cv_wrapper" <<WRAPPER
-#!/bin/bash
-. "${_CV_PREFIX_SCRIPT}" || exit \$?
-if ! command -v "\$1" >/dev/null 2>&1; then
-    printf '[cvenv] ERROR on %s: command not found: %s\\n' \
-        "\$(hostname 2>/dev/null || printf unknown)" "\$1" >&2
-    printf '[cvenv] VIRTUAL_ENV=%s\\n' "\${VIRTUAL_ENV:-unset}" >&2
-    printf '[cvenv] PATH=%s\\n' "\$PATH" >&2
-    exit 127
-fi
-exec "\$@"
-WRAPPER
-chmod +x "$_cv_wrapper"
-
-# Clean up both temp files if the launcher or payload is killed, cancelled,
-# or times out (SIGTERM/SIGINT/SIGHUP) — or exits normally.  Without this,
-# the .cvexec.* files are left on the shared filesystem whenever the job
-# fails before reaching the explicit rm below.
-_cv_exec_cleanup() {
-    command rm -f "$_cv_prefix_script" "$_cv_wrapper" 2>/dev/null
-}
-trap '_cv_exec_cleanup' EXIT INT TERM HUP
-
-local _cv_rc
-case "$_cv_launcher" in
-    srun)
-        # srun needs --export=ALL so every rank inherits CV_* env vars.
-        srun --export=ALL "${_cv_launcher_opts[@]}" "$_cv_wrapper" "$@"
-        _cv_rc=$?
-        ;;
-    *)
-        # mpirun/mpiexec and unknown launchers: inject the wrapper as the
-        # launched program, following the common
-        # "<launcher> [options] <program> [args]" convention.
-        "$_cv_launcher" "${_cv_launcher_opts[@]}" "$_cv_wrapper" "$@"
-        _cv_rc=$?
-        ;;
-esac
-
-rm -f "$_cv_prefix_script" "$_cv_wrapper"
-trap - EXIT INT TERM HUP
-return $_cv_rc
+[ -n "${LD_LIBRARY_PATH:-}" ] && export LD_LIBRARY_PATH
 ]==], "")
+
+set_shell_function("_cv_restore_ld_path", [==[
+# Restore LD_LIBRARY_PATH to its pre-activation state.
+if [ -n "${_CV_LD_LIBRARY_PATH_BACKUP+x}" ]; then
+    if [ -n "$_CV_LD_LIBRARY_PATH_BACKUP" ]; then
+        LD_LIBRARY_PATH="$_CV_LD_LIBRARY_PATH_BACKUP"
+        export LD_LIBRARY_PATH
+    else
+        unset LD_LIBRARY_PATH
+    fi
+    unset _CV_LD_LIBRARY_PATH_BACKUP
+fi
+]==], "")
+
+set_shell_function("_cv_inject_ld_path", [==[
+# Inject CRAY_LD_LIBRARY_PATH merging into a venv's bin/activate script.
+# This is a belt-and-suspenders approach: even if the cvenv "source" shell
+# function is not invoked (e.g. the user runs ". env/bin/activate" or the
+local venv_dir="$1"
+local venv_subdir="${2:-}"
+local activate="${venv_dir}${venv_subdir}/bin/activate"
+
+[ -f "$activate" ] || return 0
+
+# Skip if already injected.
+if grep -q 'CV_CRAY_LD_INJECTED' "$activate" 2>/dev/null; then
+    return 0
+fi
+
+chmod u+w "$activate" 2>/dev/null || true
+
+# Build the injection block.  We use a temp file and sed to insert it
+# after the "export PATH" line in the activate script.
+local _cv_inject_tmp
+_cv_inject_tmp=$(mktemp) || return 0
+cat > "$_cv_inject_tmp" <<'CVINJECT'
+# CV_CRAY_LD_INJECTED
+# --- cvenv: merge CRAY_LD_LIBRARY_PATH into LD_LIBRARY_PATH ---
+if [ -n "${CRAY_LD_LIBRARY_PATH:-}" ]; then
+    _CV_OLD_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+    case ":${LD_LIBRARY_PATH:-}:" in
+        *":${CRAY_LD_LIBRARY_PATH}:"*) ;;
+        *)
+            if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+                LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CRAY_LD_LIBRARY_PATH}"
+            else
+                LD_LIBRARY_PATH="${CRAY_LD_LIBRARY_PATH}"
+            fi
+            export LD_LIBRARY_PATH
+            ;;
+    esac
+fi
+# --- end cvenv ---
+CVINJECT
+
+# Insert the injection block after the first "export PATH" line.
+local _cv_activate_tmp
+_cv_activate_tmp=$(mktemp) || { rm -f "$_cv_inject_tmp"; return 0; }
+
+# Try to insert after "export PATH" (standard venv activate).
+if grep -q '^export PATH$' "$activate" 2>/dev/null; then
+    sed '/^export PATH$/r '"$_cv_inject_tmp" "$activate" > "$_cv_activate_tmp"
+elif grep -q '^export VIRTUAL_ENV$' "$activate" 2>/dev/null; then
+    # Fallback: insert after "export VIRTUAL_ENV".
+    sed '/^export VIRTUAL_ENV$/r '"$_cv_inject_tmp" "$activate" > "$_cv_activate_tmp"
+else
+    # Last resort: append at end of file.
+    cat "$activate" "$_cv_inject_tmp" > "$_cv_activate_tmp"
+fi
+
+# Now inject the restore block into the deactivate function.
+# Insert it right before "unset -f deactivate" inside deactivate().
+if grep -q 'unset -f deactivate' "$_cv_activate_tmp" 2>/dev/null; then
+    local _cv_restore_tmp
+    _cv_restore_tmp=$(mktemp) || { rm -f "$_cv_inject_tmp" "$_cv_activate_tmp"; return 0; }
+    cat > "$_cv_restore_tmp" <<'CVRESTORE'
+    # --- cvenv: restore LD_LIBRARY_PATH ---
+    if [ -n "${_CV_OLD_LD_LIBRARY_PATH+x}" ]; then
+        if [ -n "$_CV_OLD_LD_LIBRARY_PATH" ]; then
+            LD_LIBRARY_PATH="$_CV_OLD_LD_LIBRARY_PATH"
+            export LD_LIBRARY_PATH
+        else
+            unset LD_LIBRARY_PATH
+        fi
+        unset _CV_OLD_LD_LIBRARY_PATH
+    fi
+    # --- end cvenv ---
+CVRESTORE
+    sed '/unset -f deactivate/r '"$_cv_restore_tmp" "$_cv_activate_tmp" > "$_cv_inject_tmp"
+    mv "$_cv_inject_tmp" "$activate"
+    rm -f "$_cv_restore_tmp"
+else
+    mv "$_cv_activate_tmp" "$activate"
+fi
+
+rm -f "$_cv_inject_tmp" "$_cv_activate_tmp"
+]==], "")
+
+
 
 set_shell_function("_cv_patch_nccl", [==[
 # Patch RPATH/RUNPATH of .so files that depend on libnccl so they find
@@ -702,7 +426,7 @@ local site_packages="${venv_dir}${venv_subdir}/lib/python"*/site-packages
 }
 [ -n "$site_packages" ] || return 0
 
-_cv_log "Patching NCCL RPATH in $site_packages (NCCL from $nccl_lib_dir)"
+#_cv_log "Patching NCCL RPATH in $site_packages (NCCL from $nccl_lib_dir)"
 
 local f
 while IFS= read -r -d '' f; do
@@ -729,6 +453,92 @@ while IFS= read -r -d '' f; do
     patchelf --set-rpath "$new_rpath" "$f" 2>/dev/null || \
         _cv_log "  WARNING: patchelf failed on $f"
 done < <(find "$site_packages" -type f \( -name '*.so' -o -name '*.so.*' \) -print0 2>/dev/null)
+]==], "")
+
+set_shell_function("_cv_write_readme", [==[
+# Write a README file next to the archive so the user knows which Lmod
+# modules were loaded when the venv was created/last modified, and how
+# to reload them before reactivating the environment.
+local venv_name="$1"
+local archive_dir="${2:-$(_cv_archive_dir)}"
+local readme="${archive_dir}/${venv_name}.README.md"
+
+# Only the writer node should write the README.
+[ "${CV_IS_WRITER:-1}" = "1" ] || return 0
+
+mkdir -p "$archive_dir" 2>/dev/null || return 0
+
+# Collect loaded Lmod modules from the environment.
+local loaded_modules="${LOADEDMODULES:-}"
+local module_files="${_LMFILES_:-}"
+local has_modules=0
+local module_lines=""
+if [ -n "$loaded_modules" ]; then
+    has_modules=1
+    local IFS=':'
+    local mod
+    for mod in $loaded_modules; do
+        [ -n "$mod" ] || continue
+        module_lines="${module_lines}module load ${mod}\n"
+    done
+    unset IFS
+fi
+
+# Determine the backend type for the instructions.
+local backend_type="python venv"
+if [ -n "${CV_CONDA:-}" ] && [ -f "${CV_JOB_SCRATCH:-}/${venv_name}/bin/conda" ]; then
+    backend_type="conda environment"
+fi
+
+# Build the README content.
+{
+    printf '# %s\n\n' "$venv_name"
+    printf 'This file was auto-generated by **cvenv**.\n'
+    printf 'Those Lmod modules that were loaded when the %s was last saved,\n' "$backend_type"
+    printf 'so you can reproduce the environment on reactivation.\n\n'
+
+    printf '## Archive\n\n'
+    printf -- '- Archive file: `%s%s`\n' "$venv_name" "${CV_BACKEND_EXT:-}"
+    printf -- '- Archive directory: `%s`\n' "$archive_dir"
+    printf -- '- Backend: %s\n' "$backend_type"
+    printf -- '- Generated: %s\n' "$(date 2>/dev/null || echo unknown)"
+    printf '\n'
+
+    printf '## Loaded modules\n\n'
+    if [ "$has_modules" = "1" ]; then
+        printf 'The following Lmod modules were loaded when this %s was last saved:\n\n' "$backend_type"
+        printf '```bash\n'
+        printf '%b' "$module_lines"
+        printf '```\n\n'
+    else
+        printf 'No Lmod modules were detected (LOADEDMODULES was unset).\n\n'
+    fi
+
+    printf '## Reactivation\n\n'
+    printf 'To reactivate this %s in a new job:\n\n' "$backend_type"
+    printf '```bash\n'
+    if [ "$has_modules" = "1" ]; then
+        printf '%b' "$module_lines"
+    fi
+    printf 'cd %s\n' "$archive_dir"
+    if [ "$backend_type" = "conda environment" ]; then
+        printf 'conda activate %s\n' "$venv_name"
+    else
+        printf 'source %s/bin/activate\n' "$venv_name"
+    fi
+    printf '```\n\n'
+
+    printf '## Notes\n\n'
+    printf -- '- Load the modules listed above **before** loading `cvenv` and activating the environment.\n'
+    printf -- '- Module versions must match (or be compatible with) those used when the environment was created.\n'
+    printf -- '- plain `srun` commands should work on every node.\n'
+    printf -- '- Run `deactivate` before leaving the job to save any changes back to the archive.\n'
+} > "$readme" 2>/dev/null || {
+    _cv_log "WARNING: could not write README: $readme"
+    return 0
+}
+
+_cv_log "Wrote README: $readme"
 ]==], "")
 
 set_shell_function("_cv_compress_venv", [==[
@@ -774,6 +584,7 @@ mv -f "$tmp" "$tarball" || {
     return 1
 }
 _cv_log "Compression complete"
+_cv_write_readme "$venv_name" "$archive_dir"
 ]==], "")
 
 set_shell_function("_cv_relocate_venv", [==[
@@ -816,7 +627,9 @@ local tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
 local target="${CV_JOB_SCRATCH}/${venv_name}"
 local rc
 
-if [ -d "$target" ] && [ -f "$target/bin/activate" ]; then
+# Detect an already-expanded environment.  venvs have bin/activate; conda
+# envs have bin/conda (and bin/python) but may lack a venv-style activate.
+if [ -d "$target" ] && { [ -f "$target/bin/activate" ] || [ -f "$target/bin/conda" ] || [ -f "$target/bin/python" ]; }; then
     _cv_log "$venv_name is already expanded at $target"
     _cv_relocate_venv "$target"
     return $?
@@ -843,6 +656,7 @@ if [ "$rc" -ne 0 ]; then
 fi
 
 _cv_relocate_venv "$target" || return 1
+_cv_inject_ld_path "$target"
 _cv_log "Decompression complete"
 ]==], "")
 
@@ -877,9 +691,11 @@ deactivate() {
 
     [ -L "$_CV_ACTIVE_LINK" ] && command rm -f "$_CV_ACTIVE_LINK"
     _cv_venv_deactivate
+    _cv_restore_ld_path
     unset -f _cv_venv_deactivate
     command rm -rf "$_CV_ACTIVE_DIR"
     _cv_scratch_cleanup
+    _cv_write_dummy_activate "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "$_CV_ACTIVE_LINK" "$_CV_ACTIVE_VENV_SUBDIR"
     unset _CV_ACTIVE_NAME _CV_ACTIVE_DIR _CV_ACTIVE_ARCHIVE_DIR _CV_ACTIVE_LINK _CV_ACTIVE_VENV_SUBDIR
     unset _CV_AUTO_ACTIVATED
     unset CVENV_RO
@@ -946,8 +762,11 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "venv" ]; then
         printf '%s\n' "$target" > "$target/.cvenv-prefix"
     fi
 
+    _cv_patch_nccl "$target" ""
+    _cv_inject_ld_path "$target" ""
     mkdir -p "$(dirname "$link_path")" || return 1
     ln -sfn "$target" "$link_path" || return 1
+    _cv_compress_venv "$target" "$archive_dir" || _cv_log "WARNING: initial compression failed; will retry on deactivate"
     _cv_log "Ready: $requested -> $target"
     _cv_log "Run: source $requested/bin/activate"
     return 0
@@ -957,6 +776,10 @@ if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/$name" ]; then
     "$VIRTUAL_ENV/bin/$name" "$@"
 elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
     "$VIRTUAL_ENV/bin/python" "$@"
+elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/$name" ]; then
+    "$CONDA_PREFIX/bin/$name" "$@"
+elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    "$CONDA_PREFIX/bin/python" "$@"
 else
     "$interpreter" "$@"
 fi
@@ -969,6 +792,379 @@ _cv_python_wrapper "python" "$CV_ORIGINAL_PYTHON" "$@"
 set_shell_function("python3", [==[
 _cv_python_wrapper "python3" "$CV_ORIGINAL_PYTHON3" "$@"
 ]==], "")
+
+
+-- conda: create a named environment in scratch.
+set_shell_function("_cv_conda_create", [==[
+local requested="$1"
+shift
+
+if [ -z "$requested" ]; then
+    _cv_log "ERROR: no environment name specified"
+    return 2
+fi
+
+local venv_name target archive_dir tarball link_path
+venv_name=$(basename "${requested%/}")
+if [ -z "$venv_name" ] || [ "$venv_name" = "." ] || [ "$venv_name" = ".." ]; then
+    _cv_log "ERROR: invalid environment name: $requested"
+    return 2
+fi
+
+archive_dir=$(_cv_archive_dir) || return 1
+archive_dir=$(cd "$archive_dir" 2>/dev/null && pwd -P) || {
+    _cv_log "ERROR: archive directory does not exist: $archive_dir"
+    return 1
+}
+link_path="$PWD/$venv_name"
+tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
+target="${CV_JOB_SCRATCH}/${venv_name}"
+
+if [ -e "$venv_name" ] && [ ! -L "$venv_name" ]; then
+    _cv_log "ERROR: path already exists and is not a cvenv symlink: $venv_name"
+    return 1
+fi
+
+if [ -f "$tarball" ]; then
+    _cv_decompress_venv "$venv_name" "$archive_dir" || return 1
+else
+    mkdir -p "$CV_JOB_SCRATCH" || return 1
+    command rm -rf "$target"
+    _cv_log "Creating conda environment in job scratch: $target"
+    "$CV_CONDA" create --prefix "$target" "$@" -y || {
+        _cv_log "ERROR: conda create failed"
+        command rm -rf "$target"
+        return 1
+    }
+    printf '%s\n' "$target" > "$target/.cvenv-prefix"
+fi
+
+_cv_patch_nccl "$target" ""
+mkdir -p "$(dirname "$link_path")" || return 1
+ln -sfn "$target" "$link_path" || return 1
+_cv_compress_venv "$target" "$archive_dir" || _cv_log "WARNING: initial compression failed; will retry on deactivate"
+_cv_log "Ready: $venv_name -> $target"
+_cv_log "Run: conda activate $venv_name"
+return 0
+]==], "")
+
+-- conda: create an environment from environment.yml in scratch.
+set_shell_function("_cv_conda_env_create", [==[
+local env_file=""
+local requested=""
+local -a passthrough=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -f|--file)
+            shift
+            env_file="${1:-}"
+            ;;
+        -n|--name)
+            shift
+            requested="${1:-}"
+            ;;
+        -p|--prefix)
+            shift
+            requested="${1:-}"
+            ;;
+        -*)
+            passthrough+=("$1")
+            ;;
+        *)
+            if [ -z "$env_file" ] && [ -f "$1" ]; then
+                env_file="$1"
+            elif [ -z "$requested" ]; then
+                requested="$1"
+            else
+                passthrough+=("$1")
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [ -z "$env_file" ]; then
+    env_file="environment.yml"
+fi
+if [ ! -f "$env_file" ]; then
+    _cv_log "ERROR: environment file not found: $env_file"
+    return 1
+fi
+
+# Derive the environment name: -n/--name wins, then the name field in the
+# YAML file, then the basename of the file (without extension).
+if [ -z "$requested" ]; then
+    requested=$(grep -E '^[[:space:]]*name:' "$env_file" 2>/dev/null | head -1 | sed 's/^[[:space:]]*name:[[:space:]]*//; s/[[:space:]]*$//; s/^"\(.*\)"$/\1/; s/^'\''\(.*\)'\''$/\1/')
+fi
+if [ -z "$requested" ]; then
+    requested=$(basename "$env_file")
+    requested="${requested%.*}"
+fi
+
+local venv_name target archive_dir tarball link_path
+venv_name=$(basename "${requested%/}")
+if [ -z "$venv_name" ] || [ "$venv_name" = "." ] || [ "$venv_name" = ".." ]; then
+    _cv_log "ERROR: invalid environment name: $requested"
+    return 2
+fi
+
+archive_dir=$(_cv_archive_dir) || return 1
+archive_dir=$(cd "$archive_dir" 2>/dev/null && pwd -P) || {
+    _cv_log "ERROR: archive directory does not exist: $archive_dir"
+    return 1
+}
+link_path="$PWD/$venv_name"
+tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
+target="${CV_JOB_SCRATCH}/${venv_name}"
+
+if [ -e "$venv_name" ] && [ ! -L "$venv_name" ]; then
+    _cv_log "ERROR: path already exists and is not a cvenv symlink: $venv_name"
+    return 1
+fi
+
+if [ -f "$tarball" ]; then
+    _cv_decompress_venv "$venv_name" "$archive_dir" || return 1
+else
+    mkdir -p "$CV_JOB_SCRATCH" || return 1
+    command rm -rf "$target"
+    _cv_log "Creating conda environment from $env_file in job scratch: $target"
+    "$CV_CONDA" env create -f "$env_file" --prefix "$target" "${passthrough[@]}" -y || {
+        _cv_log "ERROR: conda env create failed"
+        command rm -rf "$target"
+        return 1
+    }
+    printf '%s\n' "$target" > "$target/.cvenv-prefix"
+fi
+
+_cv_patch_nccl "$target" ""
+mkdir -p "$(dirname "$link_path")" || return 1
+ln -sfn "$target" "$link_path" || return 1
+_cv_compress_venv "$target" "$archive_dir" || _cv_log "WARNING: initial compression failed; will retry on deactivate"
+_cv_log "Ready: $venv_name -> $target"
+_cv_log "Run: conda activate $venv_name"
+return 0
+]==], "")
+
+-- conda: patch conda's deactivate so it archives the environment.
+set_shell_function("_cv_conda_patch_deactivate", [==[
+local venv_name="$1"
+local venv_dir="$2"
+local archive_dir="$3"
+local link_path="$4"
+
+_CV_ACTIVE_NAME="$venv_name"
+_CV_ACTIVE_DIR="$venv_dir"
+_CV_ACTIVE_ARCHIVE_DIR="$archive_dir"
+_CV_ACTIVE_LINK="$link_path"
+_CV_ACTIVE_VENV_SUBDIR=""
+export _CV_ACTIVE_NAME _CV_ACTIVE_DIR _CV_ACTIVE_ARCHIVE_DIR _CV_ACTIVE_LINK _CV_ACTIVE_VENV_SUBDIR
+
+# Override the shell-level deactivate function.  When the user runs
+# "conda deactivate", the cvenv conda wrapper calls this function directly.
+# It archives the environment, then runs "conda shell.bash deactivate" to
+# let conda clean up its own env vars (CONDA_PREFIX, PATH, etc.).
+deactivate() {
+    local rc=0
+    if [ "${CVENV_RO:-0}" = "1" ]; then
+        _cv_log "CVENV_RO set; skipping recompression for ${_CV_ACTIVE_NAME}"
+    else
+        _cv_log "Saving ${_CV_ACTIVE_NAME} before deactivation"
+        _cv_compress_venv "$_CV_ACTIVE_DIR" "$_CV_ACTIVE_ARCHIVE_DIR" || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            _cv_log "ERROR: archive was not updated; expanded environment was retained"
+            return "$rc"
+        fi
+    fi
+
+    [ -L "$_CV_ACTIVE_LINK" ] && command rm -f "$_CV_ACTIVE_LINK"
+
+    # Let conda clean up its own environment variables.
+    eval "$("$CV_CONDA" shell.bash deactivate)"
+
+    # Restore PS1 in case conda's deactivate lost it.
+    if [ -n "${_CV_PS1_BACKUP+x}" ]; then
+        PS1="$_CV_PS1_BACKUP"
+        export PS1
+        unset _CV_PS1_BACKUP
+    fi
+
+    # Restore LD_LIBRARY_PATH to its pre-activation state.
+    _cv_restore_ld_path
+
+    command rm -rf "$_CV_ACTIVE_DIR"
+    _cv_scratch_cleanup
+    _cv_write_dummy_activate "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "$_CV_ACTIVE_LINK" ""
+    unset _CV_ACTIVE_NAME _CV_ACTIVE_DIR _CV_ACTIVE_ARCHIVE_DIR _CV_ACTIVE_LINK _CV_ACTIVE_VENV_SUBDIR
+    unset _CV_AUTO_ACTIVATED
+    unset CVENV_RO
+    _cv_log "Environment archived and scratch copy removed"
+}
+]==], "")
+
+-- conda: main wrapper.
+set_shell_function("conda", [==[
+# Locate conda if not detected at module load time.
+if [ -z "${CV_CONDA:-}" ]; then
+    CV_CONDA=$(type -P conda 2>/dev/null)
+    if [ -z "$CV_CONDA" ]; then
+        _cv_log "ERROR: conda is not available"
+        return 127
+    fi
+fi
+
+# Activation/deactivation uses "conda shell.bash activate/deactivate"
+# (the binary, not the shell function) to avoid infinite recursion.
+# Other subcommands are passed to the conda binary directly.
+local _cv_conda_cmd="${1:-}"
+
+case "$_cv_conda_cmd" in
+    create)
+        shift
+        local requested=""
+        local -a passthrough=()
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                -n|--name)
+                    shift
+                    requested="${1:-}"
+                    ;;
+                -p|--prefix)
+                    shift
+                    requested="${1:-}"
+                    ;;
+                -*)
+                    passthrough+=("$1")
+                    ;;
+                *)
+                    if [ -z "$requested" ]; then
+                        requested="$1"
+                    else
+                        passthrough+=("$1")
+                    fi
+                    ;;
+            esac
+            shift
+        done
+        if [ -z "$requested" ]; then
+            _cv_log "ERROR: conda create requires an environment name (-n/--name)"
+            return 2
+        fi
+        _cv_conda_create "$requested" "${passthrough[@]}"
+        return $?
+        ;;
+    env)
+        local _cv_conda_subcmd="${2:-}"
+        case "$_cv_conda_subcmd" in
+            create)
+                shift 2
+                _cv_conda_env_create "$@"
+                return $?
+                ;;
+            *)
+                "$CV_CONDA" "$@"
+                return $?
+                ;;
+        esac
+        ;;
+    activate)
+        shift
+        local requested="${1:-}"
+        if [ -z "$requested" ]; then
+            _cv_log "ERROR: conda activate requires an environment name"
+            return 2
+        fi
+        local venv_name archive_dir target tarball link_path
+        venv_name=$(basename "${requested%/}")
+        archive_dir=$(_cv_archive_dir) || return 1
+        archive_dir=$(cd "$archive_dir" 2>/dev/null && pwd -P) || return 1
+        target="${CV_JOB_SCRATCH}/${venv_name}"
+        link_path="$PWD/$venv_name"
+        tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
+
+        # If a stale symlink exists (target is truly dead), remove it so we
+        # can decompress/relink fresh.
+        if [ -L "$requested" ]; then
+            local _cv_link_target
+            _cv_link_target=$(readlink -f "$requested" 2>/dev/null) || _cv_link_target=""
+            if [ -z "$_cv_link_target" ] || [ ! -d "$_cv_link_target" ]; then
+                _cv_log "Removing stale symlink: $requested -> $(readlink "$requested" 2>/dev/null)"
+                command rm -f "$requested"
+            fi
+        fi
+
+        # A conda environment is recognised by bin/conda or bin/python.
+        # Remove a stub directory left by a previous deactivation.
+        if [ -d "$link_path" ] && [ ! -L "$link_path" ] && \
+            [ -f "${link_path}/bin/activate" ] && \
+            grep -q 'CVENV_STUB' "${link_path}/bin/activate" 2>/dev/null; then
+            command rm -rf "$link_path"
+        fi
+        if [ -d "$target" ] && { [ -f "$target/bin/conda" ] || [ -f "$target/bin/python" ]; }; then
+            mkdir -p "$(dirname "$link_path")" || return 1
+            ln -sfn "$target" "$link_path" || return 1
+        elif [ -f "$tarball" ]; then
+            _cv_decompress_venv "$venv_name" "$archive_dir" || return 1
+            mkdir -p "$(dirname "$link_path")" || return 1
+            ln -sfn "$target" "$link_path" || return 1
+        else
+            _cv_log "ERROR: no archive or scratch environment found for $venv_name"
+            _cv_log "       looked for: $tarball"
+            _cv_log "       and scratch: $target"
+            return 1
+        fi
+
+        # Propagate the environment to all nodes in the allocation so that
+        # plain "srun <cmd>" works on every node.
+        _cv_propagate_nodes "$venv_name" "$archive_dir" ""
+
+        # Activate via "conda shell.bash activate" which outputs shell code
+        # to eval.  This avoids calling the conda shell function (which would
+        # re-enter the cvenv wrapper and recurse infinitely).
+        local rc
+        _CV_PS1_BACKUP="$PS1"
+        eval "$("$CV_CONDA" shell.bash activate "$target")"
+        rc=$?
+        [ "$rc" -eq 0 ] || { unset _CV_PS1_BACKUP; return "$rc"; }
+
+        # Merge CRAY_LD_LIBRARY_PATH and conda env libs into LD_LIBRARY_PATH.
+        if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib" ]; then
+            _cv_augment_ld_path "$CONDA_PREFIX/lib"
+        else
+            _cv_augment_ld_path
+        fi
+
+        _cv_conda_patch_deactivate "$venv_name" "$target" "$archive_dir" "$link_path"
+        return 0
+        ;;
+    deactivate)
+        if declare -f deactivate >/dev/null 2>&1 && [ -n "${_CV_ACTIVE_DIR:-}" ]; then
+            deactivate
+            return $?
+        fi
+        eval "$("$CV_CONDA" shell.bash deactivate)"
+        return $?
+        ;;
+    install|remove|uninstall|update|upgrade)
+        local rc
+        "$CV_CONDA" "$@"
+        rc=$?
+        if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ] && \
+           [ "${CONDA_PREFIX:-}" = "$_CV_ACTIVE_DIR" ]; then
+            _cv_patch_nccl "$_CV_ACTIVE_DIR" ""
+            _cv_log "Saving environment changes after conda $_cv_conda_cmd"
+            _cv_compress_venv "$_CV_ACTIVE_DIR" "$_CV_ACTIVE_ARCHIVE_DIR" || return $?
+            _cv_propagate_nodes "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "" 1
+        fi
+        return "$rc"
+        ;;
+    *)
+        "$CV_CONDA" "$@"
+        return $?
+        ;;
+esac
+]==], "")
+
 
 -- uv: bare venv creation.
 set_shell_function("_cv_uv_venv", [==[
@@ -1015,8 +1211,11 @@ else
     printf '%s\n' "$target" > "$target/.cvenv-prefix"
 fi
 
+_cv_patch_nccl "$target" ""
+_cv_inject_ld_path "$target" ""
 mkdir -p "$(dirname "$link_path")" || return 1
 ln -sfn "$target" "$link_path" || return 1
+_cv_compress_venv "$target" "$archive_dir" || _cv_log "WARNING: initial compression failed; will retry on deactivate"
 unset _CV_EXPANDED_LINK _CV_EXPANDED_DIR _CV_EXPANDED_ARCHIVE_DIR
 _cv_log "Ready: $requested -> $target"
 _cv_log "Run: source $requested/bin/activate"
@@ -1078,8 +1277,11 @@ else
     }
 fi
 
+_cv_patch_nccl "$target" "/.venv"
+_cv_inject_ld_path "$target" "/.venv"
 mkdir -p "$(dirname "$link_path")" || return 1
 ln -sfn "$target" "$link_path" || return 1
+_cv_compress_venv "$target" "$archive_dir" || _cv_log "WARNING: initial compression failed; will retry on deactivate"
 _cv_log "Ready: $requested -> $target"
 _cv_log "Run: source $requested/.venv/bin/activate"
 return 0
@@ -1087,7 +1289,7 @@ return 0
 
 set_shell_function("_cv_uv_auto_activate", [==[
 # Auto-activate a cvenv-managed .venv found by walking up from $PWD.
-[ -n "${VIRTUAL_ENV:-}" ] && return 0
+{ [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; } && return 0
 
 local search_dir="$PWD"
 local venv_dir=""
@@ -1099,6 +1301,14 @@ while [ "$search_dir" != "/" ]; do
     search_dir=$(dirname "$search_dir")
 done
 [ -n "$venv_dir" ] || return 0
+
+# If the activate file is a cvenv stub, the venv was archived on
+# deactivation.  Use the source wrapper to decompress and activate.
+if grep -q 'CVENV_STUB' "$venv_dir/bin/activate" 2>/dev/null; then
+    source "$venv_dir/bin/activate" || return 0
+    # source wrapper handled everything (decompress, activate, patch).
+    return 0
+fi
 
 local target=""
 if [ -L "$venv_dir" ]; then
@@ -1136,6 +1346,7 @@ else
 fi
 
 builtin source "$venv_dir/bin/activate" || return 0
+_cv_augment_ld_path
 
 if [ "${VIRTUAL_ENV:-}" = "${target}${venv_subdir}" ]; then
     _cv_patch_deactivate "$venv_name" "$target" "$archive_dir" "$link_path" "$venv_subdir"
@@ -1150,7 +1361,7 @@ return 0
 
 set_shell_function("_cv_uv_discover_expand", [==[
 # Walk up to find and expand a .venv archive so uv's own discovery finds it.
-[ -n "${VIRTUAL_ENV:-}" ] && return 0
+{ [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; } && return 0
 
 local search_dir="$PWD"
 while [ "$search_dir" != "/" ]; do
@@ -1186,7 +1397,7 @@ return 0
 
 set_shell_function("_cv_uv_run_expand", [==[
 # Expand a uv-init project archive so uv run can use the scratch venv.
-[ -n "${VIRTUAL_ENV:-}" ] && return 0
+{ [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; } && return 0
 
 local run_dir="$PWD"
 while [ "$run_dir" != "/" ] && [ ! -f "$run_dir/pyproject.toml" ]; do
@@ -1256,8 +1467,8 @@ case "$_cv_uv_cmd" in
         ;;
 esac
 
-# Auto-expand a .venv archive in $PWD if no venv is active.
-if [ -z "${VIRTUAL_ENV:-}" ] && [ "$_cv_uv_cmd" != "venv" ] && [ "$_cv_uv_cmd" != "init" ]; then
+# Auto-expand a .venv archive in $PWD if no venv (or conda env) is active.
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -z "${CONDA_PREFIX:-}" ] && [ "$_cv_uv_cmd" != "venv" ] && [ "$_cv_uv_cmd" != "init" ]; then
     # Clean up stale expansion if its symlink is gone, but never remove a
     # scratch dir that $PWD/.venv still points to (it may be a fresh venv).
     if [ -n "${_CV_EXPANDED_LINK:-}" ] && [ ! -e "$_CV_EXPANDED_LINK" ]; then
@@ -1289,7 +1500,7 @@ if [ -z "${VIRTUAL_ENV:-}" ] && [ "$_cv_uv_cmd" != "venv" ] && [ "$_cv_uv_cmd" !
 fi
 
 # Auto-activate a local .venv for mutating uv commands and uv run.
-if [ -z "${VIRTUAL_ENV:-}" ]; then
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -z "${CONDA_PREFIX:-}" ]; then
     local _cv_auto_deactivate=0
     case "$_cv_uv_cmd" in
         pip)
@@ -1387,6 +1598,7 @@ if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ]; then
                 _cv_patch_nccl "$_CV_ACTIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}"
                 _cv_log "Saving environment changes after uv $_cv_uv_cmd ${2:-}"
                 _cv_compress_venv "$_CV_ACTIVE_DIR" "$_CV_ACTIVE_ARCHIVE_DIR" || return $?
+                _cv_propagate_nodes "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}" 1
             fi
         fi
     fi
@@ -1428,7 +1640,8 @@ if [ -n "${_CV_EXPANDED_LINK:-}" ]; then
         unset _CV_EXPANDED_LINK _CV_EXPANDED_DIR _CV_EXPANDED_ARCHIVE_DIR
     fi
 fi
-if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && [ -n "${VIRTUAL_ENV:-}" ]; then
+if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && \
+   { [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; }; then
     local _cv_venv_root
     _cv_venv_root=$(dirname "$_CV_ACTIVE_LINK")
     if [ "$PWD" != "$_cv_venv_root" ]; then
@@ -1459,7 +1672,8 @@ if [ -n "${_CV_EXPANDED_LINK:-}" ]; then
         unset _CV_EXPANDED_LINK _CV_EXPANDED_DIR _CV_EXPANDED_ARCHIVE_DIR
     fi
 fi
-if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && [ -n "${VIRTUAL_ENV:-}" ]; then
+if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && \
+   { [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; }; then
     local _cv_venv_root
     _cv_venv_root=$(dirname "$_CV_ACTIVE_LINK")
     if [ "$PWD" != "$_cv_venv_root" ]; then
@@ -1489,7 +1703,8 @@ if [ -n "${_CV_EXPANDED_LINK:-}" ]; then
         unset _CV_EXPANDED_LINK _CV_EXPANDED_DIR _CV_EXPANDED_ARCHIVE_DIR
     fi
 fi
-if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && [ -n "${VIRTUAL_ENV:-}" ]; then
+if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && \
+   { [ -n "${VIRTUAL_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; }; then
     local _cv_venv_root
     _cv_venv_root=$(dirname "$_CV_ACTIVE_LINK")
     if [ "$PWD" != "$_cv_venv_root" ]; then
@@ -1498,6 +1713,130 @@ if [ -n "${_CV_AUTO_ACTIVATED:-}" ] && [ -n "${_CV_ACTIVE_LINK:-}" ] && [ -n "${
     fi
 fi
 return 0
+]==], "")
+
+
+set_shell_function("_cv_propagate_nodes", [==[
+# Decompress the venv archive on every node in the Slurm allocation so
+# that plain "srun <cmd>" works on every node.  Called from the source
+# and conda-activate wrappers after the head node has decompressed its
+# own copy, and after pip/uv/conda install to refresh stale nodes.
+#
+# Arguments:
+#   $1 venv_name
+#   $2 archive_dir
+#   $3 venv_subdir  (e.g. "/.venv" for uv-init projects, "" otherwise)
+#   $4 force        (optional: "1" = remove existing copy before extracting)
+#
+# Only runs when:
+#   - CV_MULTI_NODE=1 (multi-node Slurm allocation)
+#   - CV_IS_WRITER=1 (head node only, to avoid every node re-propagating)
+#   - srun is available on PATH
+#   - SLURM_JOB_ID is set
+local venv_name="$1"
+local archive_dir="$2"
+local venv_subdir="${3:-}"
+local force="${4:-0}"
+
+[ "${CV_MULTI_NODE:-0}" = "1" ] || return 0
+[ "${CV_IS_WRITER:-1}" = "1" ] || return 0
+[ -n "${SLURM_JOB_ID:-}" ] || return 0
+command -v srun >/dev/null 2>&1 || return 0
+
+local tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
+[ -f "$tarball" ] || return 0
+
+if [ "$force" = "1" ]; then
+    _cv_log "Re-propagating ${venv_name} to all nodes (force) via srun ..."
+else
+    _cv_log "Propagating ${venv_name} to all nodes via srun ..."
+fi
+
+# Build a self-contained script that each remote node will execute.
+# It mirrors what _cv_decompress_venv does but is standalone (does not
+# rely on the cvenv shell functions being defined on the remote node).
+# The script MUST live on the shared filesystem so every node can read it;
+# a local mktemp (/tmp) would not be visible on remote nodes.
+local _cv_prop_script="${archive_dir}/.cvenv-propagate-$$.sh"
+cat > "$_cv_prop_script" <<'PROPSCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+venv_name="$1"
+archive_dir="$2"
+venv_subdir="$3"
+backend_ext="$4"
+backend_decompress="$5"
+job_scratch="$6"
+force="$7"
+
+tarball="${archive_dir}/${venv_name}${backend_ext}"
+target="${job_scratch}/${venv_name}"
+activate="${target}${venv_subdir}/bin/activate"
+conda_bin="${target}${venv_subdir}/bin/conda"
+
+# In force mode, skip the head node (SLURM_NODEID 0) — it already has
+# the up-to-date copy that was just installed/recompressed.
+if [ "$force" = "1" ] && [ -n "${SLURM_NODEID:-}" ] && [ "$SLURM_NODEID" = "0" ]; then
+    exit 0
+fi
+
+# Already present on this node?
+if [ -d "$target" ]; then
+    if [ "$force" = "1" ]; then
+        rm -rf "$target"
+    elif [ -f "$activate" ] || [ -f "$conda_bin" ] || [ -f "$target/bin/python" ]; then
+        exit 0
+    else
+        rm -rf "$target"
+    fi
+fi
+
+[ -f "$tarball" ] || { echo "[cvenv] ERROR: archive not found: $tarball" >&2; exit 1; }
+mkdir -p "$job_scratch" || { echo "[cvenv] ERROR: cannot create $job_scratch" >&2; exit 1; }
+
+set -o pipefail
+eval "$backend_decompress \"$tarball\"" | tar -xf - -C "$job_scratch"
+rc=$?
+set +o pipefail
+[ "$rc" -eq 0 ] || { echo "[cvenv] ERROR: extraction failed on $(hostname 2>/dev/null || echo unknown)" >&2; exit "$rc"; }
+
+# Relocate prefix if the archive was created in a different /tmp path.
+marker="${target}/.cvenv-prefix"
+if [ -f "$marker" ]; then
+    old_prefix=$(cat "$marker")
+    if [ -n "$old_prefix" ] && [ "$old_prefix" != "$target" ]; then
+        reloc_python="${CV_ORIGINAL_PYTHON3:-${CV_ORIGINAL_PYTHON:-python3}}"
+        while IFS= read -r -d '' file; do
+            chmod u+w "$file" 2>/dev/null || true
+            OLD_PREFIX="$old_prefix" NEW_PREFIX="$target" \
+                "$reloc_python" -c 'import os,pathlib,sys;p=pathlib.Path(sys.argv[1]);d=p.read_bytes();o=os.environ["OLD_PREFIX"].encode();n=os.environ["NEW_PREFIX"].encode();p.write_bytes(d.replace(o,n)) if o in d else None' \
+                "$file" 2>/dev/null || true
+        done < <(grep -IlZR -- "$old_prefix" "$target/bin" 2>/dev/null || true)
+        printf '%s\n' "$target" > "$marker" 2>/dev/null || true
+    fi
+fi
+
+echo "[cvenv] ${venv_name} ready on $(hostname 2>/dev/null || echo unknown)"
+PROPSCRIPT
+chmod +x "$_cv_prop_script"
+
+# Run one task per node across all nodes in the allocation.
+local _cv_num_nodes="${SLURM_JOB_NUM_NODES:-1}"
+srun --export=ALL --ntasks="$_cv_num_nodes" --ntasks-per-node=1 \
+    "$_cv_prop_script" \
+    "$venv_name" "$archive_dir" "$venv_subdir" \
+    "$CV_BACKEND_EXT" "$CV_BACKEND_DECOMPRESS" "$CV_JOB_SCRATCH" "$force"
+local _cv_prop_rc=$?
+
+rm -f "$_cv_prop_script"
+
+if [ "$_cv_prop_rc" -ne 0 ]; then
+    _cv_log "WARNING: propagation to some nodes failed (rc=$_cv_prop_rc); plain 'srun' may not work on all nodes"
+    return 0
+fi
+
+_cv_log "Propagation complete; plain 'srun' commands should now work"
 ]==], "")
 
 set_shell_function("source", [==[
@@ -1524,7 +1863,15 @@ if [ "$#" -ge 1 ] && [[ "$1" == */bin/activate ]]; then
     link_path="$PWD/$requested_dir"
     tarball="${archive_dir}/${venv_name}${CV_BACKEND_EXT}"
 
-    if [ ! -e "$activate_path" ]; then
+    # A CVENV_STUB marker means the venv was archived by cvenv on
+    # deactivation; treat it as "needs decompression" just like a
+    # missing file.
+    local _cv_is_stub=0
+    if [ -f "$activate_path" ] && grep -q 'CVENV_STUB' "$activate_path" 2>/dev/null; then
+        _cv_is_stub=1
+    fi
+
+    if [ ! -e "$activate_path" ] || [ "$_cv_is_stub" = "1" ]; then
         if [ ! -f "$tarball" ]; then
             if [ -n "$venv_subdir" ] && [ -f "$target/pyproject.toml" ]; then
                 _cv_log "Creating .venv for uv project: $target/.venv"
@@ -1541,16 +1888,51 @@ if [ "$#" -ge 1 ] && [[ "$1" == */bin/activate ]]; then
         else
             _cv_decompress_venv "$venv_name" "$archive_dir" || return 1
             mkdir -p "$(dirname "$link_path")" || return 1
+            # Remove a stub directory left by a previous deactivation
+            # so ln -sfn creates the symlink at $link_path rather than
+            # inside it.
+            if [ "$_cv_is_stub" = "1" ] && [ -d "$link_path" ] && [ ! -L "$link_path" ]; then
+                command rm -rf "$link_path"
+            fi
             ln -sfn "$target" "$link_path" || return 1
         fi
     fi
 
-    builtin source "$@"
-    rc=$?
-    [ "$rc" -eq 0 ] || return "$rc"
+    # Propagate the environment to all nodes in the allocation so that
+    # plain "srun <cmd>" works on every node.
+    _cv_propagate_nodes "$venv_name" "$archive_dir" "$venv_subdir"
+
+    # Detect whether this is a conda environment.  Conda envs have
+    # bin/conda (and may lack a venv-style bin/activate).  For conda envs
+    # we activate via "conda shell.bash activate" directly, because
+    # conda's own bin/activate script calls "conda activate" which would
+    # re-enter the cvenv conda wrapper and cause double augmentation.
+    local _cv_src_is_conda=0
+    if [ -f "${target}${venv_subdir}/bin/conda" ]; then
+        _cv_src_is_conda=1
+    fi
+
+    if [ "$_cv_src_is_conda" = "1" ] && [ -n "${CV_CONDA:-}" ]; then
+        _CV_PS1_BACKUP="$PS1"
+        eval "$("$CV_CONDA" shell.bash activate "${target}${venv_subdir}")"
+        rc=$?
+        [ "$rc" -eq 0 ] || { unset _CV_PS1_BACKUP; return "$rc"; }
+    else
+        builtin source "$@"
+        rc=$?
+        [ "$rc" -eq 0 ] || return "$rc"
+    fi
+
+    if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib" ]; then
+        _cv_augment_ld_path "$CONDA_PREFIX/lib"
+    else
+        _cv_augment_ld_path
+    fi
 
     if [ "${VIRTUAL_ENV:-}" = "${target}${venv_subdir}" ]; then
         _cv_patch_deactivate "$venv_name" "$target" "$archive_dir" "$link_path" "$venv_subdir"
+    elif [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_PREFIX:-}" = "${target}${venv_subdir}" ]; then
+        _cv_conda_patch_deactivate "$venv_name" "$target" "$archive_dir" "$link_path"
     fi
     return 0
 fi
@@ -1597,36 +1979,40 @@ command rm "${_cv_safe_args[@]}"
 
 set_shell_function("pip", [==[
 local rc
-if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/pip" ]; then
-    "$VIRTUAL_ENV/bin/pip" "$@"
+local _cv_pip_env="${VIRTUAL_ENV:-${CONDA_PREFIX:-}}"
+if [ -n "$_cv_pip_env" ] && [ -x "$_cv_pip_env/bin/pip" ]; then
+    "$_cv_pip_env/bin/pip" "$@"
 else
     command pip "$@"
 fi
 rc=$?
 
-if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ] && [ "$VIRTUAL_ENV" = "${_CV_ACTIVE_DIR}${_CV_ACTIVE_VENV_SUBDIR:-}" ]; then
+if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ] && [ "$_cv_pip_env" = "${_CV_ACTIVE_DIR}${_CV_ACTIVE_VENV_SUBDIR:-}" ]; then
     _cv_patch_nccl "$_CV_ACTIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}"
     _cv_log "Saving environment changes after pip"
     _cv_compress_venv "$_CV_ACTIVE_DIR" "$_CV_ACTIVE_ARCHIVE_DIR" || return $?
+    _cv_propagate_nodes "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}" 1
 fi
 return "$rc"
 ]==], "")
 
 set_shell_function("pip3", [==[
 local rc
-if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/pip3" ]; then
-    "$VIRTUAL_ENV/bin/pip3" "$@"
-elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/pip" ]; then
-    "$VIRTUAL_ENV/bin/pip" "$@"
+local _cv_pip_env="${VIRTUAL_ENV:-${CONDA_PREFIX:-}}"
+if [ -n "$_cv_pip_env" ] && [ -x "$_cv_pip_env/bin/pip3" ]; then
+    "$_cv_pip_env/bin/pip3" "$@"
+elif [ -n "$_cv_pip_env" ] && [ -x "$_cv_pip_env/bin/pip" ]; then
+    "$_cv_pip_env/bin/pip" "$@"
 else
     command pip3 "$@"
 fi
 rc=$?
 
-if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ] && [ "$VIRTUAL_ENV" = "${_CV_ACTIVE_DIR}${_CV_ACTIVE_VENV_SUBDIR:-}" ]; then
+if [ "$rc" -eq 0 ] && [ -n "${_CV_ACTIVE_DIR:-}" ] && [ "$_cv_pip_env" = "${_CV_ACTIVE_DIR}${_CV_ACTIVE_VENV_SUBDIR:-}" ]; then
     _cv_patch_nccl "$_CV_ACTIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}"
     _cv_log "Saving environment changes after pip"
     _cv_compress_venv "$_CV_ACTIVE_DIR" "$_CV_ACTIVE_ARCHIVE_DIR" || return $?
+    _cv_propagate_nodes "$_CV_ACTIVE_NAME" "$_CV_ACTIVE_ARCHIVE_DIR" "${_CV_ACTIVE_VENV_SUBDIR:-}" 1
 fi
 return "$rc"
 ]==], "")
@@ -1661,13 +2047,16 @@ if mode() == "load" then
     if uv ~= "" then
         LmodMessage("[cvenv] uv detected: 'uv venv', 'uv init', and 'uv run' are supported")
     end
+    if conda ~= "" then
+        LmodMessage("[cvenv] conda detected: 'conda create', 'conda env create', and 'conda activate' are supported")
+    end
     if multi_node then
-        LmodMessage("[cvenv] Use 'cvexec <launcher> [opts] -- <cmd>' for MPI commands so every rank activates its local venv")
+        LmodMessage("[cvenv] Environments are propagated to all nodes at activation; plain 'srun' should work")
     end
 end
 
 -- Metadata ------------------------------------------------------------
 whatis("Name: cvenv")
-whatis("Description: Transparent compressed Python venvs for parallel filesystems")
+whatis("Description: Transparent compressed Python and conda venvs for parallel filesystems")
 whatis("Backend: " .. backend_compress)
 """

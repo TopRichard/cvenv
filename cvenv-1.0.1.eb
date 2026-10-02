@@ -484,10 +484,41 @@ if [ -n "$loaded_modules" ]; then
     unset IFS
 fi
 
-# Determine the backend type for the instructions.
+# Determine the backend type and venv subdirectory for the instructions.
+# Prefer the _CV_ACTIVE_* variables set during activation; fall back to
+# filesystem inspection for initial creation (before activation).
 local backend_type="python venv"
-if [ -n "${CV_CONDA:-}" ] && [ -f "${CV_JOB_SCRATCH:-}/${venv_name}/bin/conda" ]; then
+local venv_subdir="${_CV_ACTIVE_VENV_SUBDIR:-}"
+local venv_base="${CV_JOB_SCRATCH:-}/${venv_name}"
+
+# Conda environments are identified by the conda-meta/ directory, which
+# every conda env contains regardless of whether bin/conda is present
+# (prefix-based envs may lack bin/conda).
+if [ -n "${CV_CONDA:-}" ] && [ -d "${venv_base}/conda-meta" ]; then
     backend_type="conda environment"
+    venv_subdir=""
+elif [ -n "${CV_UV:-}" ]; then
+    # uv init creates a project directory with a .venv subdirectory.
+    if [ -f "${venv_base}/pyproject.toml" ] && [ -d "${venv_base}/.venv" ]; then
+        backend_type="uv project"
+        venv_subdir="/.venv"
+    # uv venv creates a bare .venv (venv_name would be ".venv").
+    elif [ "$venv_name" = ".venv" ] && [ -d "${venv_base}" ]; then
+        backend_type="uv venv"
+        venv_subdir=""
+    fi
+fi
+
+# Build the activate command for the reactivation section.
+local activate_cmd=""
+if [ "$backend_type" = "conda environment" ]; then
+    activate_cmd="conda activate ${venv_name}"
+else
+    if [ -n "$venv_subdir" ]; then
+        activate_cmd="source ${venv_name}${venv_subdir}/bin/activate"
+    else
+        activate_cmd="source ${venv_name}/bin/activate"
+    fi
 fi
 
 # Build the README content.
@@ -521,18 +552,15 @@ fi
         printf '%b' "$module_lines"
     fi
     printf 'cd %s\n' "$archive_dir"
-    if [ "$backend_type" = "conda environment" ]; then
-        printf 'conda activate %s\n' "$venv_name"
-    else
-        printf 'source %s/bin/activate\n' "$venv_name"
-    fi
+    printf '%s\n' "$activate_cmd"
     printf '```\n\n'
 
     printf '## Notes\n\n'
     printf -- '- Load the modules listed above **before** loading `cvenv` and activating the environment.\n'
+    printf -- '- `module load cvenv` must precede activation so the cvenv wrapper functions are available.\n'
     printf -- '- Module versions must match (or be compatible with) those used when the environment was created.\n'
     printf -- '- plain `srun` commands should work on every node.\n'
-    printf -- '- Run `deactivate` before leaving the job to save any changes back to the archive.\n'
+    printf -- '- Run `deactivate` (or `conda deactivate` for conda environments) before leaving the job to save any changes back to the archive.\n'
 } > "$readme" 2>/dev/null || {
     _cv_log "WARNING: could not write README: $readme"
     return 0

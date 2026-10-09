@@ -174,9 +174,9 @@ else
     default_scratch = "/tmp/cvenv_" .. user
 end
 
-local job_scratch = os.getenv("CV_JOB_SCRATCH") or default_scratch
+local job_scratch = os.getenv("CV_JOB_SCRATCH") or os.getenv("LOCALSCRATCH") or default_scratch
 local archive_dir = os.getenv("CV_ARCHIVE_DIR") or ""
-local job_cache = os.getenv("CV_JOB_CACHE") or os.getenv("SCRATCH") or os.getenv("LOCALSCRATCH") or ""
+local job_cache = os.getenv("CV_JOB_CACHE") or os.getenv("LOCALSCRATCH") or os.getenv("SCRATCH") or ""
 
 -- Command detection ---------------------------------------------------
 local function command_path(name)

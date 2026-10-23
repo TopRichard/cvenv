@@ -76,7 +76,7 @@ jobs:
             eb cvenv-0.1.0.eb --robot
           '
 
-      - name: Run cvenv end-to-end tests
+      - name: Run cvenv functionality tests
         run: |
           runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
             set -eo pipefail

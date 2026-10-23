@@ -2,9 +2,9 @@
 
 `cvenv` is an [Lmod](https://lmod.readthedocs.io) module that transparently
 wraps Python virtual environments **and conda environments** so the **expanded
-environment lives in job-local scratch** (typically `/tmp`, but any node-local
-path such as `$LOCALSCRATCH` or `$SCRATCH` can be used) while only a **single
-compressed tar archive** is kept on the parallel filesystem.
+environment lives in job-local scratch** (typically `/tmp`, or another
+node-local path selected with `CV_JOB_SCRATCH` such as `$LOCALSCRATCH`) while
+only a **single compressed tar archive** is kept on the parallel filesystem.
 
 On HPC systems with shared parallel filesystems (Lustre, GPFS, BeeGFS, …) a
 Python or conda environment contains thousands of small files. Creating,
@@ -18,25 +18,26 @@ filesystem.
 ## Features
 
 - **Node-local expansion**: the environment is decompressed into node-local
-  scratch (`/tmp` by default, or any path set via `CV_JOB_SCRATCH`,
-  `$LOCALSCRATCH`, `$SCRATCH`) on every node.
-- **Single compressed archive**: only one `.tar.zst` (or `.tar.gz` if `pzstd`
-  is unavailable) file is written back to the parallel filesystem at
-  `deactivate` time.
-- **Parallel zstd compression**: uses `pzstd` with `SLURM_CPUS_ON_NODE` (or 1)
-  threads at compression level `-3` when available; falls back to `gzip`
-  otherwise.
+  scratch (`/tmp` by default, or a path selected with `CV_JOB_SCRATCH` or
+  `$LOCALSCRATCH`) on every node.
+- **Single compressed archive**: one `.tar.zst` (or `.tar.gz` if `pzstd` is
+  unavailable) file is created with the environment, updated after successful
+  mutating commands, and updated at `deactivate` time.
+- **Parallel zstd compression**: uses `pzstd` with `SLURM_CPUS_ON_NODE`,
+  `OMP_NUM_THREADS`, or `nproc` threads (defaulting to 1) at compression
+  level `-3` when available; falls back to `gzip` otherwise.
 - **Slurm integration**: automatically detects the job-local scratch
   directory (`/tmp/<job-id>` inside a Slurm allocation, `/tmp/cvenv_<user>`
-  outside). Override with `CV_JOB_SCRATCH` to use any node-local path such as
-  `$LOCALSCRATCH` or `$SCRATCH`.
+  outside). `CV_JOB_SCRATCH` overrides this path, and `$LOCALSCRATCH` is used
+  automatically when `CV_JOB_SCRATCH` is unset.
 - **Multi-node support**: each node decompresses its own independent copy;
   only the head node (`SLURM_NODEID 0`) recompresses the shared archive.
   At activation, the environment is automatically propagated to all nodes via
   `srun`, so plain `srun <cmd>` works on every node.
 - **uv support**: when `uv` is found on `PATH`, `uv venv`, `uv init`, and
-  `uv run` are supported automatically. Changing directory away from the venv
-  directory auto-deactivates and archives it.
+  `uv run` are supported automatically. Auto-activated `uv run` deactivates
+  without recompression unless `CVENV_RO=0`; changing directory away from the
+  venv directory auto-deactivates and archives it.
 - **conda / miniconda support**: when `conda` is found on `PATH`, `conda
   create`, `conda env create`, and `conda activate` are supported
   automatically. Environments are expanded into node-local scratch and stored
@@ -46,7 +47,7 @@ filesystem.
 
 ## Requirements
 
-- [Lmod](https://lmod.readthedocs.io) (Tcl/Lua module system)
+- [Lmod](https://lmod.readthedocs.io) with Lua module support
 - Bash (the shell wrappers are Bash-specific)
 - Python (`python3`) on `PATH`
 - Optional: `pzstd` (parallel zstd) for faster `.tar.zst` archives; falls
@@ -132,8 +133,6 @@ conda install numpy pytest
 conda deactivate
 ```
 
-### conda from environment.yml
-
 ```bash
 module load cvenv
 conda env create -f environment.yml
@@ -145,7 +144,7 @@ An existing archive can be reactivated with the same command used to create it:
 
 ```bash
 source myenv/bin/activate      # Python venv / uv
-conda activate myenv            # conda
+conda activate myenv           # conda
 ```
 
 ## Environment variables
@@ -159,12 +158,12 @@ conda activate myenv            # conda
 
 ### Env-var persistence
 
-When the environment is compressed, cvenv snapshots a curated set of
-environment variables (CUDA, NCCL, OMP, HF, XLA, etc.) into
-`.cvenv-envvars.sh` inside the archive. On the next activation those
-variables are restored automatically; variables already set in the shell
-take precedence. Secrets (`HF_TOKEN`, etc.) are excluded. To persist your
-own variables, prefix them with `CV_USER_` (e.g.
+When the environment is compressed, cvenv snapshots the built-in allow-listed
+variables (`PYTHONHASHSEED` and `PYTHONUNBUFFERED`) into
+`.cvenv-envvars.sh` inside the archive. On the next activation those variables
+are restored automatically; variables already set in the shell take
+precedence. Secrets such as `HF_TOKEN` are excluded. To persist your own
+variables, prefix them with `CV_USER_` (e.g.
 `export CV_USER_MY_CONFIG=/path/to/config`).
 
 ### Archive naming
@@ -177,7 +176,7 @@ same basename (e.g. `.venv`) is used in different directories.
 
 1. `module load cvenv` installs shell function wrappers for `python`,
    `python3`, `pip`, `pip3`, `source`, `uv`, `conda`, `rm`, `cd`, `pushd`,
-   and `popd`.
+   `popd`.
    It also prints informational messages (job scratch path, node count,
    writer/read-only status, uv/conda detection, backend).
 2. `python -m venv myenv` (or `uv venv`, `conda create`) creates the
@@ -195,9 +194,9 @@ same basename (e.g. `.venv`) is used in different directories.
    the archive and removes the scratch expansion. On non-head nodes
    (`CV_IS_WRITER=0`), compression is skipped. A `<name>.README.md` file is
    written next to the archive recording the loaded Lmod modules and
-   reactivation instructions. A minimal stub `myenv/bin/activate` is left
-   behind so `source myenv/bin/activate` works again exactly as in a standard
-   Python venv.
+   reactivation instructions. A minimal stub
+   `myenv/bin/activate` is left behind so `source myenv/bin/activate` works
+   again exactly as in a standard Python venv.
 
 ### Auto-generated README
 

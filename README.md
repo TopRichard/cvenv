@@ -145,7 +145,7 @@ An existing archive can be reactivated with the same command used to create it:
 
 ```bash
 source myenv/bin/activate      # Python venv / uv
-conda activate myenv            # conda
+conda activate myenv           # conda
 ```
 
 ## Environment variables

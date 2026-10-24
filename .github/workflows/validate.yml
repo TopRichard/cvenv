@@ -9,84 +9,62 @@ on:
 jobs:
   check-easyconfig:
     name: Check cvenv easyconfig and run tests
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/eessi/client:rocky8-amd64
-      options: --privileged
+    runs-on: ubuntu-24.04
     defaults:
       run:
         shell: bash
     env:
-      HOME: ${{ github.workspace }}
-      EASYBUILD_PREFIX: ${{ github.workspace }}/local-sw
+      EASYBUILD_PREFIX: ${{ github.workspace }}/sw
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - name: Initialize EESSI and load EasyBuild
+      - name: Set up EESSI
+        uses: eessi/github-action-eessi@v3
+        with:
+          eessi_stack_version: '2025.06'
+          init_direnv: false
+
+      - name: Verify EESSI access
         run: |
-          set -eo pipefail
-          cvmfs_config chksetup
-          mount -t cvmfs software.eessi.io /cvmfs/software.eessi.io
-          source /cvmfs/software.eessi.io/versions/2025.06/init/lmod/bash
+          set -euo pipefail
+          test -d /cvmfs/software.eessi.io/versions/2025.06
           module --version
-
-          cat > /tmp/eessi-ci-env.sh <<'EOF'
-          source /cvmfs/software.eessi.io/versions/2025.06/init/lmod/bash
-          module load EasyBuild/5.4.1
-          EOF
-          chmod 0644 /tmp/eessi-ci-env.sh
-          chown -R eessi:eessi "$GITHUB_WORKSPACE"
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            source /tmp/eessi-ci-env.sh
-            module list
-            eb --version
-          '
 
       - name: Validate cvenv easyconfig
         run: |
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            set -eo pipefail
-            source /tmp/eessi-ci-env.sh
-            eb cvenv-0.1.0.eb --dry-run
-          '
+          set -euo pipefail
+          module load EasyBuild/5.4.1
+          eb cvenv-0.1.0.eb --dry-run
 
       - name: Install Miniconda for conda tests
         run: |
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            set -eo pipefail
-            source /tmp/eessi-ci-env.sh
-            eb Miniconda3-25.7.0-2.eb --robot
-          '
+          set -euo pipefail
+          module load EasyBuild/5.4.1
+          eb Miniconda3-25.7.0-2.eb --robot
 
       - name: Load uv for cvenv tests
         run: |
-          printf 'module load uv/0.7.13-GCCcore-14.2.0\n' >> /tmp/eessi-ci-env.sh
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            set -eo pipefail
-            mkdir -p "$HOME/cvenv-test"
-            source /tmp/eessi-ci-env.sh
-            uv --version
-          '
+          set -euo pipefail
+          module load uv/0.7.13-GCCcore-14.2.0
+          mkdir -p "$HOME/cvenv-test"
+          uv --version
 
       - name: Install cvenv module
         run: |
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            set -eo pipefail
-            source /tmp/eessi-ci-env.sh
-            eb cvenv-0.1.0.eb --robot
-          '
+          set -euo pipefail
+          module load EasyBuild/5.4.1
+          eb cvenv-0.1.0.eb --robot
 
       - name: Run cvenv functionality tests
         run: |
-          runuser -u eessi -- env HOME="$HOME" USER=eessi bash -c '
-            set -eo pipefail
-            source /tmp/eessi-ci-env.sh
-            module use "$EASYBUILD_PREFIX/modules/all"
-            module load Miniconda3/25.7.0-2
-            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-            conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-            module load cvenv/0.1.0
+          set -euo pipefail
+          module load uv/0.7.13-GCCcore-14.2.0
+          module use "$EASYBUILD_PREFIX/modules/all"
+          module load Miniconda3/25.7.0-2
+          conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+          conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+          module load cvenv/0.1.0
 
-            cd "$HOME/cvenv-test"
-            bash "$GITHUB_WORKSPACE/scripts/cvenv_e2e.sh"
-          '
+          cd "$HOME/cvenv-test"
+          bash "$GITHUB_WORKSPACE/scripts/cvenv_e2e.sh"

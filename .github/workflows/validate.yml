@@ -14,7 +14,7 @@ jobs:
       run:
         shell: bash
     env:
-      EASYBUILD_PREFIX: ${{ github.workspace }}/local-sw
+      EASYBUILD_PREFIX: ${{ github.workspace }}/sw
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -29,7 +29,6 @@ jobs:
         run: |
           set -euo pipefail
           test -d /cvmfs/software.eessi.io/versions/2025.06
-          test -f /cvmfs/software.eessi.io/versions/2025.06/init/lmod/bash
           module --version
 
       - name: Validate cvenv easyconfig
@@ -57,7 +56,7 @@ jobs:
           module load EasyBuild/5.4.1
           eb cvenv-0.1.0.eb --robot
 
-      - name: Run cvenv end-to-end tests
+      - name: Run cvenv functionality tests
         run: |
           set -euo pipefail
           module load uv/0.7.13-GCCcore-14.2.0

@@ -67,4 +67,4 @@ jobs:
           module load cvenv/0.1.0
 
           cd "$HOME/cvenv-test"
-          bash "$GITHUB_WORKSPACE/scripts/cvenv_e2e.sh"
+          bash "$GITHUB_WORKSPACE/scripts/cvenv_tests.sh"

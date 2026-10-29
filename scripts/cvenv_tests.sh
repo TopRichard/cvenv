@@ -157,7 +157,7 @@ archive_has() {
         DETAIL="cannot list archive: $archive"
         return 1
     fi
-    printf '%s\n' "$listing" | grep -qF -- "$member" || { DETAIL="'$member' not in $archive"; return 1; }
+    [[ "$listing" == *"$member"* ]] || { DETAIL="'$member' not in $archive"; return 1; }
 }
 
 repack_archive() {

@@ -348,7 +348,7 @@ printf '\033[1;34m[cvenv]\033[0m %s\n' "$*" >&2
 ]==], "")
 
 set_shell_function("_cv_validate_public_link", [==[
-local link_path="$1" target="$2" allow_stub="${3:-0}" resolved
+local link_path="$1" allow_stub="${3:-0}"
 [ -e "$link_path" ] || [ -L "$link_path" ] || return 0
 if [ "$allow_stub" = "1" ] && [ -d "$link_path" ] && [ ! -L "$link_path" ] && \
    [ -f "$link_path/bin/activate" ] && \
@@ -356,14 +356,6 @@ if [ "$allow_stub" = "1" ] && [ -d "$link_path" ] && [ ! -L "$link_path" ] && \
     return 0
 fi
 [ -L "$link_path" ] || return 1
-resolved=$(readlink -f -- "$link_path" 2>/dev/null) || resolved=""
-if [ -e "$link_path" ]; then
-    [ "$resolved" = "$target" ] || return 1
-elif [[ "$resolved" == "${CV_JOB_SCRATCH}"/* ]]; then
-    return 0
-else
-    return 1
-fi
 ]==], "")
 
 set_shell_function("_cv_validate_component", [==[

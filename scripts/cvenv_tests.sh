@@ -620,6 +620,23 @@ t_absolute_path() {
     must deact || return 1
 }
 
+t_path_safety() {
+    mkdir -p "$TEST_ROOT/permissive-target"
+    ln -sfn "$TEST_ROOT/permissive-target" "$TEST_ROOT/permissive-link"
+
+    must mkenv "$TEST_ROOT/permissive-link" || return 1
+
+    check "existing symlink replaced by environment link" [ -L "$TEST_ROOT/permissive-link" ]
+    check "environment link points into scratch"          under_scratch "$(scratch_of "$TEST_ROOT/permissive-link")"
+    check "ordinary symlink target remains intact"        [ -d "$TEST_ROOT/permissive-target" ]
+
+    must deact || return 1
+
+    mkdir -p "$TEST_ROOT/occupied-dir"
+    check "existing directory is refused" not mkenv "$TEST_ROOT/occupied-dir"
+    check "existing directory remains intact" [ -d "$TEST_ROOT/occupied-dir" ]
+}
+
 t_name_collision() {
     mkdir -p a b
     must mkenv a/.venv || return 1
@@ -1247,6 +1264,7 @@ run t_conda                "conda create/activate/relocate"
 run t_conda_mutations      "conda install/remove persistence"
 run t_conda_unactivated_unload_guard "conda unactivated unload warning"
 run t_absolute_path        "absolute venv path"
+run t_path_safety           "symlinks are replaceable; directories are protected"
 run t_name_collision       "same basename in different dirs"
 run t_collision_python     "python same-basename collision safety"
 run t_collision_uv         "uv same-basename collision safety"

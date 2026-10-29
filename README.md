@@ -237,9 +237,8 @@ the exact archive name and validates this manifest before reuse, reserves
 scratch atomically, and reports an explicit error if two environments resolve
 to the same identity or if a generated name collides with another identity.
 Creating an environment that already exists is refused; activate it instead.
-Existing ordinary files, directories, and unrelated symlinks are never replaced;
-cvenv only uses an absent path, a marked stub, a symlink to its expected
-job-scratch target, or a stale symlink within the current job-scratch root.
+Existing ordinary files and directories are not replaced; unrelated symlinks
+may be replaced by the new environment link.
 
 Older archives without a manifest remain usable through their stub or legacy
 name. The first successful save adds a manifest while retaining the original

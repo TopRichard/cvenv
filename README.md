@@ -44,8 +44,7 @@ filesystem.
   automatically. Environments are expanded into node-local scratch and stored
   as a single compressed archive on the parallel filesystem. `conda install`,
   `conda remove`, `conda uninstall`, `conda update`, `conda upgrade`, and
-  `conda env update` recompress the archive; `conda`
-  deactivate` archives and cleans up the scratch copy.
+  `conda env update` recompress the archive; `conda deactivate` archives and cleans up the scratch copy.
 
 ## Requirements
 

@@ -190,8 +190,10 @@ end
 
 local multi_node = false
 local is_writer = true
+local virtual_env = os.getenv("VIRTUAL_ENV") or ""
+local conda_prefix = os.getenv("CONDA_PREFIX") or ""
 if mode() == "load" then
-    if os.getenv("VIRTUAL_ENV") or os.getenv("CONDA_PREFIX") then
+    if virtual_env ~= "" or conda_prefix ~= "" then
         LmodError("cvenv: deactivate the active environment before loading the module")
     end
 
@@ -319,7 +321,7 @@ local job_scratch = configured_scratch ~= "" and configured_scratch or default_s
 if mode() == "unload" then
     local unload_scratch = os.getenv("_CV_DEFAULT_SCRATCH") or ""
     if unload_scratch ~= "" and unload_scratch:match("^/tmp/cvenv%-[A-Za-z0-9._-]+$") then
-        execute{cmd="rmdir -- " .. unload_scratch, modeA={"unload"}}
+        execute{cmd="rmdir -- " .. unload_scratch .. " 2>/dev/null || true", modeA={"unload"}}
     end
 end
 
@@ -4605,3 +4607,4 @@ if mode() == "load" then
 end
 
 """
+

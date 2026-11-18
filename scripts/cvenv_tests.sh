@@ -566,6 +566,7 @@ t_conda() {
     local old=$(scratch_of cenv)
     must qq conda activate cenv || return 1
     check "CONDA_PREFIX is the scratch copy"     under_scratch "${CONDA_PREFIX:-}"
+    check "conda lib not in LD_LIBRARY_PATH"     not has_path "${LD_LIBRARY_PATH:-}" "$CONDA_PREFIX/lib"
     must qq conda deactivate || return 1
     check "scratch copy removed"                 not [ -e "$old" ]
     export CV_JOB_SCRATCH="${BASE_SCRATCH}-job2"
@@ -1289,3 +1290,4 @@ run t_conda_failed_activation "failed conda activation retains scratch"
 echo
 printf 'Single node tests: Passed: %d  Failed: %d  Skipped: %d\n' "$PASSED" "$FAILED" "$SKIPPED"
 [ "$FAILED" -eq 0 ]
+

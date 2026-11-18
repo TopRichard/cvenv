@@ -190,8 +190,10 @@ end
 
 local multi_node = false
 local is_writer = true
+local virtual_env = os.getenv("VIRTUAL_ENV") or ""
+local conda_prefix = os.getenv("CONDA_PREFIX") or ""
 if mode() == "load" then
-    if os.getenv("VIRTUAL_ENV") or os.getenv("CONDA_PREFIX") then
+    if virtual_env ~= "" or conda_prefix ~= "" then
         LmodError("cvenv: deactivate the active environment before loading the module")
     end
 
@@ -319,7 +321,7 @@ local job_scratch = configured_scratch ~= "" and configured_scratch or default_s
 if mode() == "unload" then
     local unload_scratch = os.getenv("_CV_DEFAULT_SCRATCH") or ""
     if unload_scratch ~= "" and unload_scratch:match("^/tmp/cvenv%-[A-Za-z0-9._-]+$") then
-        execute{cmd="rmdir -- " .. unload_scratch, modeA={"unload"}}
+        execute{cmd="rmdir -- " .. unload_scratch .. " 2>/dev/null || true", modeA={"unload"}}
     end
 end
 
@@ -1251,7 +1253,7 @@ return 0
 ]==], "")
 
 set_shell_function("_cv_augment_ld_path", [==[
-# Save LD_LIBRARY_PATH and append CRAY_LD_LIBRARY_PATH (and optionally $CONDA_PREFIX/lib for conda).
+# Save LD_LIBRARY_PATH, append CRAY_LD_LIBRARY_PATH, and expose an optional pkgconfig directory.
 local _extra="${1:-}"
 if [ -z "${_CV_LD_LIBRARY_PATH_BACKUP+x}" ]; then
     _CV_LD_LIBRARY_PATH_BACKUP="${LD_LIBRARY_PATH:-}"
@@ -1267,18 +1269,6 @@ if [ -n "${CRAY_LD_LIBRARY_PATH:-}" ]; then
                 LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$CRAY_LD_LIBRARY_PATH"
             else
                 LD_LIBRARY_PATH="$CRAY_LD_LIBRARY_PATH"
-            fi
-            ;;
-    esac
-fi
-if [ -n "$_extra" ]; then
-    case ":${LD_LIBRARY_PATH:-}:" in
-        *":$_extra:"*) ;;
-        *)
-            if [ -n "${LD_LIBRARY_PATH:-}" ]; then
-                LD_LIBRARY_PATH="$_extra:$LD_LIBRARY_PATH"
-            else
-                LD_LIBRARY_PATH="$_extra"
             fi
             ;;
     esac
@@ -3033,7 +3023,7 @@ case "$_cv_conda_cmd" in
         }
         _cv_set_prompt "$display_name" "$_cv_ps1_before"
 
-        # Merge CRAY_LD_LIBRARY_PATH and conda env libs into LD_LIBRARY_PATH.
+        # Merge CRAY_LD_LIBRARY_PATH and expose conda pkgconfig without overriding system libraries.
         if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib" ]; then
             _cv_augment_ld_path "$CONDA_PREFIX/lib"
         else
@@ -4348,6 +4338,7 @@ if [ "$#" -ge 1 ] && [[ "$1" == */bin/activate ]]; then
     }
     _cv_set_prompt "$display_name" "$_cv_ps1_before"
 
+    # Expose conda pkgconfig without overriding system libraries through LD_LIBRARY_PATH.
     if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/lib" ]; then
         _cv_augment_ld_path "$CONDA_PREFIX/lib"
     fi

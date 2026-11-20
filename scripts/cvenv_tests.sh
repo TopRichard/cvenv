@@ -1360,3 +1360,4 @@ run t_conda_failed_activation "failed conda activation retains scratch"
 echo
 printf 'Single node tests: Passed: %d  Failed: %d  Skipped: %d\n' "$PASSED" "$FAILED" "$SKIPPED"
 [ "$FAILED" -eq 0 ]
+

@@ -45,6 +45,9 @@ filesystem.
   as a single compressed archive on the parallel filesystem. `conda install`,
   `conda remove`, `conda uninstall`, `conda update`, `conda upgrade`, and
   `conda env update` recompress the archive; `conda deactivate` archives and cleans up the scratch copy.
+- **`pkg-config` support**: activation prepends the environment’s
+  `lib/pkgconfig` and `share/pkgconfig` directories to `PKG_CONFIG_PATH` when
+  they exist; deactivation restores the original value.
 
 ## Requirements
 
@@ -201,14 +204,14 @@ and save changes to their own copy of the archive.
 ## Environment variables
 
 `CV_JOB_SCRATCH`, `CV_ARCHIVE_DIR`, `CV_JOB_CACHE`, `CV_COMPRESS_CPUS`,
-`PIP_CACHE_DIR`, and `UV_CACHE_DIR` are restored to their prior values when
+`PIP_CACHE_DIR`, `UV_CACHE_DIR`, and `CONDA_PKGS_DIRS` are restored to their prior values when
 the module is unloaded.
 
 | Variable | Description |
 |---|---|
 | `CV_ARCHIVE_DIR` | Archive directory. If unset before module load, the current directory at creation/activation time is used. `/tmp` and `CV_JOB_SCRATCH` paths are rejected. |
 | `CV_JOB_SCRATCH` | Expansion directory. Uses `CV_JOB_SCRATCH`, then `$LOCALSCRATCH`, then a private `/tmp` directory. Each node decompresses into its own configured node-local scratch path. |
-| `CV_JOB_CACHE` | Absolute pip/uv cache directory. When set, it overrides `PIP_CACHE_DIR` and `UV_CACHE_DIR`, including changes made after module load. Defaults to `$LOCALSCRATCH`, then `$SCRATCH`; when neither is defined, pip uses its default and uv uses `${CV_JOB_SCRATCH}/uv-cache`. |
+| `CV_JOB_CACHE` | Absolute conda/pip/uv cache directory. When set, it overrides `PIP_CACHE_DIR`, `UV_CACHE_DIR`, and `CONDA_PKGS_DIRS`, including changes made after module load. Defaults to `$LOCALSCRATCH`, then `$SCRATCH`; when neither is defined, pip uses its default, uv uses `${CV_JOB_SCRATCH}/uv-cache`, and conda uses `${CV_JOB_SCRATCH}/conda-cache`. |
 | `CV_COMPRESS_CPUS` | Positive integer compression thread count. Set it before module load; otherwise it is derived from `SLURM_CPUS_ON_NODE`, `OMP_NUM_THREADS`, or `nproc`, defaulting to 1. |
 | `CVENV_RO` | Set to `1` to skip recompression on deactivation. Set to `0` to preserve normal recompression, including after `uv run`. Successful mutating commands (`pip install/uninstall`, `pip3 install/uninstall`, `python -m pip install/uninstall`, `uv pip install/uninstall`, `uv add/remove/sync/run`, `conda install/remove/uninstall/update/upgrade`, `conda env update`) recompress on writer nodes regardless. |
 | `CVENV_ARCHIVE_NAME` | Exact archive basename for portable activation when multiple portable archives share a display name. The `.tar.zst` or `.tar.gz` suffix is optional. |

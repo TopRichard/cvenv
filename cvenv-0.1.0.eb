@@ -45,7 +45,7 @@ Environment variables:
                    $LOCALSCRATCH, then a private /tmp directory. Each node
                    decompresses into its own node-local scratch path.
   CV_JOB_CACHE     Absolute pip/uv cache directory. If set, overrides
-                   PIP_CACHE_DIR and UV_CACHE_DIR, including changes made
+                   PIP_CACHE_DIR, CONDA_PKGS_DIRS and UV_CACHE_DIR, including changes made
                    after module load. Defaults to $LOCALSCRATCH if defined,
                    otherwise $SCRATCH if defined; pip then uses its default,
                    while uv falls back to ${CV_JOB_SCRATCH}/uv-cache only
@@ -134,7 +134,9 @@ Notes:
     you cd away from the owning directory.  Read-only commands use uv's own
     .venv discovery.
   * conda / miniconda support is enabled automatically when conda is found
-    on PATH at module load time.  "conda create", "conda env create", and
+    on PATH at module load time. conda's cache uses CV_JOB_CACHE, then
+    $LOCALSCRATCH or $SCRATCH, then ${CV_JOB_SCRATCH}/conda-cache.
+    "conda create", "conda env create", and
     "conda activate" are intercepted so the environment lives in job-local
     scratch while only a compressed archive is stored on the parallel
     filesystem.  "conda install" / "conda remove" against an active
@@ -342,6 +344,7 @@ pushenv("CV_JOB_CACHE", job_cache)
 if job_cache ~= "" then
     pushenv("PIP_CACHE_DIR", job_cache)
     pushenv("UV_CACHE_DIR", job_cache)
+    pushenv("CONDA_PKGS_DIRS", job_cache)
 end
 
 -- Bash helper functions -----------------------------------------------
@@ -419,7 +422,7 @@ if [ -n "${CV_JOB_CACHE:-}" ]; then
             return 1
             ;;
     esac
-    export PIP_CACHE_DIR="$CV_JOB_CACHE" UV_CACHE_DIR="$CV_JOB_CACHE"
+    export PIP_CACHE_DIR="$CV_JOB_CACHE" UV_CACHE_DIR="$CV_JOB_CACHE" CONDA_PKGS_DIRS="$CV_JOB_CACHE"
 fi
 ]==], "")
 
@@ -1275,31 +1278,39 @@ if [ -n "${CRAY_LD_LIBRARY_PATH:-}" ]; then
 fi
 [ -n "${LD_LIBRARY_PATH:-}" ] && export LD_LIBRARY_PATH
 
-# Also add the corresponding pkgconfig directory to PKG_CONFIG_PATH so pkg-config finds .pc files.
-local _pkg_cfg=""
-if [ -n "$_extra" ] && [ -d "${_extra}/pkgconfig" ]; then
-    _pkg_cfg="${_extra}/pkgconfig"
+# Also add the corresponding pkgconfig directories to PKG_CONFIG_PATH so pkg-config finds .pc files.
+local -a _pkg_dirs=()
+local _pkg_cfg _share_dir
+if [ -n "$_extra" ]; then
+    if [ -d "${_extra}/pkgconfig" ]; then
+        _pkg_dirs+=("${_extra}/pkgconfig")
+    fi
+    _share_dir="${_extra%/lib}/share/pkgconfig"
+    if [ -d "$_share_dir" ]; then
+        _pkg_dirs+=("$_share_dir")
+    fi
 elif [ -n "${VIRTUAL_ENV:-}" ]; then
-    local _pc_dir
-    for _pc_dir in "${VIRTUAL_ENV}/lib/pkgconfig"; do
-        if [ -d "$_pc_dir" ]; then
-            _pkg_cfg="$_pc_dir"
-            break
-        fi
-    done
+    if [ -d "${VIRTUAL_ENV}/lib/pkgconfig" ]; then
+        _pkg_dirs+=("${VIRTUAL_ENV}/lib/pkgconfig")
+    fi
+    if [ -d "${VIRTUAL_ENV}/share/pkgconfig" ]; then
+        _pkg_dirs+=("${VIRTUAL_ENV}/share/pkgconfig")
+    fi
 fi
-if [ -n "$_pkg_cfg" ]; then
-    case ":${PKG_CONFIG_PATH:-}:" in
-        *":$_pkg_cfg:"*) ;;
-        *)
-            if [ -n "${PKG_CONFIG_PATH:-}" ]; then
-                PKG_CONFIG_PATH="$_pkg_cfg:$PKG_CONFIG_PATH"
-            else
-                PKG_CONFIG_PATH="$_pkg_cfg"
-            fi
-            export PKG_CONFIG_PATH
-            ;;
-    esac
+if [ "${#_pkg_dirs[@]}" -gt 0 ]; then
+    for _pkg_cfg in "${_pkg_dirs[@]}"; do
+        case ":${PKG_CONFIG_PATH:-}:" in
+            *":$_pkg_cfg:"*) ;;
+            *)
+                if [ -n "${PKG_CONFIG_PATH:-}" ]; then
+                    PKG_CONFIG_PATH="$_pkg_cfg:$PKG_CONFIG_PATH"
+                else
+                    PKG_CONFIG_PATH="$_pkg_cfg"
+                fi
+                export PKG_CONFIG_PATH
+                ;;
+        esac
+    done
 fi
 return 0
 ]==], "")
@@ -2355,6 +2366,17 @@ case "$source_kind" in
 esac
 target="${CV_JOB_SCRATCH}/${scratch_name}"
 
+# The Lua module normally sets CONDA_PKGS_DIRS to CV_JOB_CACHE at load time.
+# Keep the cache contract consistent when CV_JOB_CACHE changes after load.
+_cv_apply_job_cache || return 1
+if [ -z "${CONDA_PKGS_DIRS:-}" ]; then
+    export CONDA_PKGS_DIRS="${CV_JOB_CACHE:-${CV_JOB_SCRATCH}/conda-cache}"
+fi
+mkdir -p "$CONDA_PKGS_DIRS" || {
+    _cv_log "ERROR: cannot create conda cache directory: $CONDA_PKGS_DIRS"
+    return 1
+}
+
 local existing_path="$venv_name"
 [ "$source_kind" != "conda-prefix" ] || existing_path="$requested"
 if ! _cv_validate_public_link "$existing_path" "$target" 0; then
@@ -2717,6 +2739,7 @@ return 0
 ]==], "")
 
 set_shell_function("conda", [==[
+_cv_apply_job_cache || return 1
 # Locate conda if not detected at module load time.
 if [ -z "${CV_CONDA:-}" ]; then
     CV_CONDA=$(type -P conda 2>/dev/null)
@@ -4331,6 +4354,7 @@ if [ "$#" -ge 1 ] && [[ "$1" == */bin/activate ]]; then
         builtin source "$@"
         rc=$?
         [ "$rc" -eq 0 ] || return "$rc"
+        _cv_augment_ld_path
     fi
     _cv_restore_env_vars "$target" "$venv_subdir" || {
         _cv_log "ERROR: invalid environment variable snapshot"

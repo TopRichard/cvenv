@@ -505,6 +505,39 @@ t_ld_path() {
     check "LD_LIBRARY_PATH restored"             eq "${LD_LIBRARY_PATH:-}" /cvenv-tests/orig
 }
 
+t_pkg_config_path() {
+    export PKG_CONFIG_PATH=/cvenv-tests/orig-pc
+    must mkenv pcshare || return 1
+    must act pcshare || return 1
+    mkdir -p "$VIRTUAL_ENV/lib/pkgconfig" "$VIRTUAL_ENV/share/pkgconfig"
+    printf 'Name: cvenv-test\n' > "$VIRTUAL_ENV/share/pkgconfig/cvenv-test.pc"
+    must deact || return 1
+    check "share pkgconfig is archived" archive_has pcshare share/pkgconfig/cvenv-test.pc
+    must act pcshare || return 1
+    check "lib pkgconfig is exposed"    has_path "${PKG_CONFIG_PATH:-}" "$VIRTUAL_ENV/lib/pkgconfig"
+    check "share pkgconfig is exposed"   has_path "${PKG_CONFIG_PATH:-}" "$VIRTUAL_ENV/share/pkgconfig"
+    check "original pkgconfig preserved" has_path "${PKG_CONFIG_PATH:-}" /cvenv-tests/orig-pc
+    must deact || return 1
+    check "PKG_CONFIG_PATH is restored" eq "${PKG_CONFIG_PATH:-}" /cvenv-tests/orig-pc
+}
+
+t_conda_pkg_config_path() {
+    [ -n "${CV_CONDA:-}" ] || { SKIP_REASON="conda not found at module load"; return 78; }
+    export PKG_CONFIG_PATH=/cvenv-tests/orig-pc
+    must qq conda create -n cpc python || return 1
+    must qq conda activate cpc || return 1
+    mkdir -p "$CONDA_PREFIX/lib/pkgconfig" "$CONDA_PREFIX/share/pkgconfig"
+    printf 'Name: cvenv-test\n' > "$CONDA_PREFIX/share/pkgconfig/cvenv-test.pc"
+    must qq conda deactivate || return 1
+    check "conda share pkgconfig is archived" archive_has cpc share/pkgconfig/cvenv-test.pc
+    must qq conda activate cpc || return 1
+    check "conda lib pkgconfig is exposed"    has_path "${PKG_CONFIG_PATH:-}" "$CONDA_PREFIX/lib/pkgconfig"
+    check "conda share pkgconfig is exposed"   has_path "${PKG_CONFIG_PATH:-}" "$CONDA_PREFIX/share/pkgconfig"
+    check "conda original pkgconfig preserved" has_path "${PKG_CONFIG_PATH:-}" /cvenv-tests/orig-pc
+    must qq conda deactivate || return 1
+    check "conda PKG_CONFIG_PATH is restored"  eq "${PKG_CONFIG_PATH:-}" /cvenv-tests/orig-pc
+}
+
 t_envvars() {
     must mkenv ev || return 1
     must act ev || return 1
@@ -566,6 +599,7 @@ t_conda() {
     local old=$(scratch_of cenv)
     must qq conda activate cenv || return 1
     check "CONDA_PREFIX is the scratch copy"     under_scratch "${CONDA_PREFIX:-}"
+    check "conda lib not in LD_LIBRARY_PATH"     not has_path "${LD_LIBRARY_PATH:-}" "$CONDA_PREFIX/lib"
     must qq conda deactivate || return 1
     check "scratch copy removed"                 not [ -e "$old" ]
     export CV_JOB_SCRATCH="${BASE_SCRATCH}-job2"
@@ -589,6 +623,40 @@ t_conda_mutations() {
     must qq conda deactivate || return 1
     must qq conda activate cmut || return 1
     check "conda remove persists" not [ -e "$CONDA_PREFIX/bin/python" ]
+}
+
+t_conda_job_cache() {
+    local case_dir
+    case_dir=$(mktemp -d "$TEST_ROOT/conda-job-cache.XXXXXX") || return 1
+    mkdir -p "$case_dir/archive" "$case_dir/scratch"
+    printf '#!/bin/sh\nexit 0\n' > "$case_dir/mock-conda"
+    chmod +x "$case_dir/mock-conda"
+
+    (
+        module -q unload "$cvenv_module" >/dev/null 2>&1
+        export CV_JOB_CACHE="$case_dir/cache"
+        module load "$cvenv_module" >/dev/null 2>&1
+        printf '%s\n' "${CONDA_PKGS_DIRS-}"
+    ) > "$case_dir/load.env"
+    check "module load maps CV_JOB_CACHE to conda cache" eq "$(cat "$case_dir/load.env")" "$case_dir/cache"
+
+    (
+        export CV_JOB_CACHE="$case_dir/cache2"
+        export CV_CONDA="$case_dir/mock-conda"
+        conda --version >/dev/null 2>&1
+        printf '%s\n' "${CONDA_PKGS_DIRS-}"
+    ) > "$case_dir/wrapper.env"
+    check "conda wrapper reapplies CV_JOB_CACHE" eq "$(cat "$case_dir/wrapper.env")" "$case_dir/cache2"
+
+    (
+        unset CV_JOB_CACHE LOCALSCRATCH SCRATCH UV_CACHE_DIR CONDA_PKGS_DIRS
+        export CV_ARCHIVE_DIR="$case_dir/archive"
+        export CV_JOB_SCRATCH="$case_dir/scratch"
+        export CV_CONDA="$case_dir/mock-conda"
+        _cv_conda_create jobcache conda-name >/dev/null 2>&1 || true
+        test -d "$case_dir/scratch/conda-cache"
+    )
+    check "conda create uses CONDA_PKGS_DIRS" eq "$?" 0
 }
 
 t_conda_unactivated_unload_guard() {
@@ -1246,6 +1314,7 @@ run t_read_only_node       "read-only node skips persistence"
 run t_rm_guard             "rm refuses to delete the active env"
 run t_rm_created_unactivated "rm deletes a created but unactivated env"
 run t_ld_path              "LD_LIBRARY_PATH merged and restored"
+run t_pkg_config_path      "PKG_CONFIG_PATH exposes lib and share pkgconfig"
 run t_envvars              "env-var snapshot saved and restored"
 run t_cd_subdirectory      "cd into subdirectory keeps env active"
 run t_pushd_popd           "pushd/popd keep env active within project"
@@ -1262,6 +1331,8 @@ run t_uv_dot_venv_auto_activate "uv auto-activates local .venv"
 run t_uv_run               "uv run uses active venv"
 run t_conda                "conda create/activate/relocate"
 run t_conda_mutations      "conda install/remove persistence"
+run t_conda_job_cache      "conda job cache overrides"
+run t_conda_pkg_config_path "conda PKG_CONFIG_PATH exposes lib and share pkgconfig"
 run t_conda_unactivated_unload_guard "conda unactivated unload warning"
 run t_absolute_path        "absolute venv path"
 run t_path_safety           "symlinks are replaceable; directories are protected"
